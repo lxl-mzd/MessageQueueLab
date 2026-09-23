@@ -1,0 +1,52 @@
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+#  鑷€犳秷鎭槦鍒?路 涓夎妭鐐?Raft 闆嗙兢
+#  MQ_PEERS = Raft 鍏ㄤ綋鎴愬憳琛紙姣忎釜鑺傜偣蹇呴』鐭ラ亾鍏ㄩ儴 3 涓垚鍛橈紝鍚嚜韬€斺€?#             鍚﹀垯 follower 涔嬮棿浜掍笉鐩歌瘑锛屼細鍒嗚鍑哄弻 Leader锛?#  MQ_FOLLOWERS = Leader 澶嶅埗鐩爣锛汳Q_LEADER_URL = Leader 涓氬姟鍏ュ彛
+#  MQ_ROLE = leader/follower锛堝啓鍙?澶嶅埗鍙ｏ紝鍚庣画 Raft 涓婁綅鎺ョ锛?# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+x-mq-peers: &mq-peers "http://mq-leader:8080,http://mq-follower-1:8080,http://mq-follower-2:8080"
+
+services:
+  mq-leader:
+    image: mq-lab:17
+    build: .
+    environment:
+      MQ_ROLE: leader
+      MQ_NODE_NAME: node-leader
+      MQ_SELF: "http://mq-leader:8080"
+      MQ_PEERS: *mq-peers
+      MQ_FOLLOWERS: "http://mq-follower-1:8080,http://mq-follower-2:8080"
+      MQ_LEADER_URL: "http://mq-leader:8080"
+    ports:
+      - "5081:8080"
+    volumes:
+      - mqlab-leader:/app/data
+
+  mq-follower-1:
+    image: mq-lab:17
+    environment:
+      MQ_ROLE: follower
+      MQ_NODE_NAME: node-follower-1
+      MQ_SELF: "http://mq-follower-1:8080"
+      MQ_PEERS: *mq-peers
+      MQ_LEADER_URL: "http://mq-leader:8080"
+    ports:
+      - "5082:8080"
+    volumes:
+      - mqlab-follower-1:/app/data
+
+  mq-follower-2:
+    image: mq-lab:17
+    environment:
+      MQ_ROLE: follower
+      MQ_NODE_NAME: node-follower-2
+      MQ_SELF: "http://mq-follower-2:8080"
+      MQ_PEERS: *mq-peers
+      MQ_LEADER_URL: "http://mq-leader:8080"
+    ports:
+      - "5083:8080"
+    volumes:
+      - mqlab-follower-2:/app/data
+
+volumes:
+  mqlab-leader:
+  mqlab-follower-1:
+  mqlab-follower-2:
