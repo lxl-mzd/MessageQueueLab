@@ -124,6 +124,8 @@ public sealed class Log
             if (_activeSegment!.LineCount >= RowsPerSegment)
                 SealActive();
         }
+
+        TryRequestCompaction();   // Leader 主写入路径同样要触发压缩检查（段数≥4 或 50% 脏率）
     }
 
     // ── 全量同步 Push（兼容旧接口：Build + Commit 一步） ──
@@ -145,6 +147,7 @@ public sealed class Log
             if (_activeSegment!.LineCount >= RowsPerSegment)
                 SealActive();
         }
+        TryRequestCompaction();   // 单机/兼容路径同样触发
         return evt;
     }
 
