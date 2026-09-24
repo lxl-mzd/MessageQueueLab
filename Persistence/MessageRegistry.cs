@@ -90,7 +90,38 @@ public static class MessageRegistry
         }
     }
 
-    /// <summary>Ack：确认完成。同步把账本 Acked 计数计入出生段（GC 触发源）</summary>
+        /// <summary>Ack：确认完成。同步把账本 Acked 计数计入出生段（GC 触发源）</summary>
+    // ── 启动重建钩子：WAL 是这张表的持久化形态，回放时逐事件重算（非独立持久化）──
+    //    Replay 按 (段序,行序) 逐行调用；e/n → Ready；d → Acked（幂等窗口自此刻起算）
+    public static void ReplayHook(string queue, string type, string? id, MqMessage? msg, LogSegment? seg, int lineNo)
+    {
+        switch (type)
+        {
+            case "e":
+            case "n":
+                if (msg is null) return;
+                Entries[Key(queue, msg.Id)] = new RegistryEntry
+                {
+                    Queue = queue,
+                    State = RegistryState.Ready,
+                    Segment = seg,
+                    SegmentPath = seg?.Path ?? "",
+                    LineNo = lineNo,
+                    Msg = msg,
+                };
+                break;
+
+            case "d":
+                if (id is null) return;
+                if (Entries.TryGetValue(Key(queue, id), out var e))
+                {
+                    e.Segment?.RecordAck();   // 出生段的销账比率记账（GC 触发依据要跨重启生效）
+                    Entries[Key(queue, id)] = e with { State = RegistryState.Acked, AckedAtUtc = DateTime.UtcNow };
+                }
+                break;
+        }
+    }
+
     /// <summary>UnityRegister: 兼容 wrapper —— QueueCore 直接传 Log 对象</summary>
     public static void UnityRegister(Log ledger, MqMessage msg, RegistryState state)
         => MarkReady(ledger.QueueName, ledger.ActiveSegment, ledger.ActiveLineNo, msg);

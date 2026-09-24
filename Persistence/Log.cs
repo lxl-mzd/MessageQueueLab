@@ -60,11 +60,20 @@ public sealed class Log
         }
 
         var topSeq = -1L;
-        foreach (var evt in segs.SelectMany(s => s.ReadAll()).OrderBy(e => e.Seq))
+        foreach (var seg in segs.OrderBy(s => s.StartIndex))
         {
-            if (evt.Seq < topSeq) continue;
-            topSeq = evt.Seq;
-            Apply(evt);
+            var lineNo = 0;
+            foreach (var evt in seg.ReadAll())
+            {
+                // 顺带重建映射表（幂等查重/GC 记账跨重启留存的基础）
+                if (evt.Seq >= topSeq)
+                {
+                    topSeq = evt.Seq;
+                    MessageRegistry.ReplayHook(QueueName, evt.Type, evt.Id, evt.Message, seg, lineNo);
+                    Apply(evt);
+                }
+                lineNo++;
+            }
         }
         _nextSeq = topSeq + 1;
 

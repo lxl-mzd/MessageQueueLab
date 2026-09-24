@@ -119,6 +119,15 @@ public class QueueCore
         {
             if (_ready.TryDequeue(out var msg))
             {
+                // ══ 幂等防线：账本已销(d 事件) → 就算消息重现也不准领 ══
+                //    场景：竞态把 Acked 覆盖、或跨重启重建间隙 —— 账本说了算，同时把内存账面销平
+                if (MessageRegistry.TryGet(QueueName, msg.Id) is { State: RegistryState.Acked })
+                {
+                    _ledger.Push("d", null, msg.Id);
+                    _emit($"🧊 [{_queueName}] 幂等拦截：id={msg.Id[..12]}… 已销账的幽灵消息 → 丢弃");
+                    continue;
+                }
+
                 // ══ TTL 检查：过期 → 死信（继续取下一条）═══
                 if (msg.ExpiresAtUtc is not null && msg.ExpiresAtUtc.Value <= DateTime.UtcNow)
                 {
@@ -255,15 +264,26 @@ public class QueueCore
     public void PushExternal(LogMessage evt)
     {
         if (string.IsNullOrEmpty(evt.Ledger) || evt.Ledger == _queueName)
+        {
             _ledger.PushExternal(evt);
+            if (evt.Message is null) return;
+            // 主账本复制事件同步挂账（Follower 王位切换后马上要靠这张表做查重/记账）
+            if (evt.Type is "e" or "n")
+                MessageRegistry.MarkReady(QueueName, null, 0, evt.Message);
+        }
         else
         {
             _dlqLedger.PushExternal(evt);
-            if (evt.Type == "e" && evt.Message is not null) _dead.Add(evt.Message);
+            if (evt.Type == "e" && evt.Message is not null)
+            {
+                _dead.Add(evt.Message);
+                MessageRegistry.MarkDead(QueueName, null, 0, evt.Message);
+            }
             if (evt.Type == "d" && evt.Id is not null)
             {
                 var removed = _dead.FirstOrDefault(m => m.Id == evt.Id);
                 if (removed is not null) _dead.Remove(removed);
+                MessageRegistry.MarkAcked(QueueName, evt.Id);
             }
         }
     }
