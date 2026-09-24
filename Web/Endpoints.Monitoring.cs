@@ -18,9 +18,14 @@ public static class MonitoringEndpoints
                 try
                 {
                     await Task.Delay(1000);
+                    // ① 锁定区巡查（业务状态变更 —— 写事件流，leader 侧产生、复制给 follower）
+                    //    注：SweepAll 内部按 ClusterOptions 判分（写角色才真正回收）
                     var reclaimed = hub.SweepAll();   // SWEEP_V2_MARKER
                     if (reclaimed > 0)
                         hub.PushEvent($"⏰ 巡查员：回收了 {reclaimed} 张逾期未交差的锁定消息（消费者可能崩了）");
+                    // ② 压缩巡查（纯磁盘 GC，不改任何业务状态——每个节点都各自扫各自的账本）
+                    //    双门槛：已封段≥4 或（50% 脏率 +（行数≥128 / 段龄>1h））
+                    hub.CompactAllChecks();
                 }
                 catch (Exception ex)
                 {

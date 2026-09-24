@@ -249,6 +249,9 @@ public class QueueCore
             return new QueueCoreStats(_queueName, _ready.Count, _locked.Count, _ledger.ItemCount, _dead.Count);
     }
 
+    // 压缩巡查入口：交给所属 Wal Log 做双门槛判定（段数≥4 / 50% 脏率）
+    public void SweepCompaction() => _ledger.SweepCompaction();
+
     public void PushExternal(LogMessage evt)
     {
         if (string.IsNullOrEmpty(evt.Ledger) || evt.Ledger == _queueName)

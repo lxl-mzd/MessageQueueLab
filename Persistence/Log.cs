@@ -125,7 +125,6 @@ public sealed class Log
                 SealActive();
         }
 
-        TryRequestCompaction();   // Leader 主写入路径同样要触发压缩检查（段数≥4 或 50% 脏率）
     }
 
     // ── 全量同步 Push（兼容旧接口：Build + Commit 一步） ──
@@ -147,7 +146,6 @@ public sealed class Log
             if (_activeSegment!.LineCount >= RowsPerSegment)
                 SealActive();
         }
-        TryRequestCompaction();   // 单机/兼容路径同样触发
         return evt;
     }
 
@@ -185,7 +183,6 @@ public sealed class Log
                 SealActive();
         }
 
-        TryRequestCompaction();
         MessageRegistry.EvictStale();               // Follower 同样挂账
     }
 
@@ -244,7 +241,11 @@ public sealed class Log
         return _state.Values.OrderBy(x => x.Seq).Select(x => x.Msg).ToList();
     }
 
-    // 触发条件（双重门槛）：段数 ≥4
+    // 触发条件（双重门槛）：已封段≥4 或（50% 脏率 +（行数≥128/段龄>1h））
+    //   v2：写入路径不再各自触发，改由后台压缩巡检线程统一定时拉起（见 Program.StartSweeper）
+    public void SweepCompaction()
+        => TryRequestCompaction();
+
     private void TryRequestCompaction()
     {
         // （1）按已封段数触发（原 Path）

@@ -106,6 +106,12 @@ public class MessageQueueHub
         return reclaimed;
     }
 
+    // 压缩巡查：每节点自己扫自己的磁盘（WAL 压缩不涉及业务状态，无需 leader/follower 之分）
+    public void CompactAllChecks()
+    {
+        foreach (var q in _queues.Values) q.SweepCompaction();
+    }
+
     // ── Leader 复制钩子（P2 核心）：推送事件到 followers，Quorum 结果回传给调用方 HTTP 响应──
     public async Task<ReplicationResult?> ReplicateQueueEventAsync(string queue, LogMessage evt)
     {
