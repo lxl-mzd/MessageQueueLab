@@ -81,7 +81,7 @@ Assert "dlx-in-dlq-list" ($dlqBody -match 'dlx-ci') "dlq=$dlqBody"
 # ---- 6. kill king -> another node becomes king within 70s ----
 $kingPort = $king -replace [regex]::Escape($Base), ""
 Write-Output "stopping king $kingPort ($($Names[$kingPort])) ..."
-docker stop $Names[$kingPort] | Out-Null
+docker compose stop $Names[$kingPort] | Out-Null
 $newKing = $null
 $deadline = (Get-Date).AddSeconds(70)
 while ((Get-Date) -lt $deadline -and -not $newKing) {
