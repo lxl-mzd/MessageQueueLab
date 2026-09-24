@@ -26,7 +26,11 @@ public static class ClusterEndpoints
             if (evt is null) return Results.BadRequest(new { error = "事件解析失败" });
 
             var q = hub.Get(queue);
-            if (q is null) return Results.NotFound(new { error = "不存在队列", queue });
+            if (q is null)
+            {
+                // 复制流自愈：王位侧声明的新队列， follower 磁盘上还不知情 → 认领建队（幂等）
+                q = hub.DeclareQueue(queue);
+            }
 
             q.PushExternal(evt);               // 幂等：Seq ≤ 已回放位点自动跳过
             return Results.Ok(new { appliedSeq = evt.Seq });

@@ -110,5 +110,16 @@ public static class QueueEndpoints
 
             return Results.Ok(new { message = msg });   // RetryCount 已 +1
         });
+
+        // ── 动态声明队列（持久化：目录落盘即真相，重启自动认领）──
+        app.MapPost("/api/q/{queue}", (string queue) =>
+        {
+            if (string.IsNullOrWhiteSpace(queue) || !System.Text.RegularExpressions.Regex.IsMatch(queue, "^[A-Za-z0-9_\\-]+$"))
+                return Results.BadRequest(new { error = "队列名仅限字母/数字/_/-" });
+            if (!ClusterOptions.IsWriter)
+                return Results.StatusCode(503);
+            var q = hub.DeclareQueue(queue);
+            return Results.Created($"/api/q/{queue}", new { declared = true, queue });
+        });
     }
 }

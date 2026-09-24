@@ -10,6 +10,7 @@
 //     Leader：本地 Push → 后台复制品推给follower（acks / required 随响应回传）
 //     Follower：拒绝业务写入（HTTP 503），仅收复制流（经 /api/cluster/replicate）
 // ═══════════════════════════════════════════════════════════════
+using System.Text.Json;
 using MessageQueueLab.Models;
 using MessageQueueLab.Persistence;
 using MessageQueueLab.Routing;
@@ -23,11 +24,14 @@ public class MessageQueueHub
     private readonly object _eventLock = new();
     private readonly List<(DateTime Ts, string Msg)> _events = new();
     private readonly ClusterReplicator? _replicator;
+    private readonly string _dataDir;
 
     public MessageQueueHub(string dataDirectory = "data", ClusterReplicator? replicator = null)
     {
         _replicator = replicator;
+        _dataDir = dataDirectory;
 
+        // ── 出厂三队列（首次启动的答案；此后磁盘目录才是真相） ──
         _queues["normal"] = new QueueCore("normal", PushEvent, dataDirectory);
         _queues["vip"]    = new QueueCore("vip", PushEvent, dataDirectory);
         _queues["error"]  = new QueueCore("error", PushEvent, dataDirectory);   // 错误专属队列（#.error 落点）
@@ -66,10 +70,104 @@ public class MessageQueueHub
             q.Stats();
             q.SetDeadSink(DeliverDead);            // ★ 死信交换机路由钩子注入
         }
+
+        // ── 持久化装载（磁盘即真相） ──
+        //    队列：扫描 data/ 下所有队列目录 → 动态/陌生队列自动认领
+        //    交换机：出厂表 → data/_exchanges.json 覆盖（如果上次运行存过）
+        LoadExtraQueues(dataDirectory);
+        LoadExchanges(dataDirectory);
     }
 
     public QueueCore? Get(string queueName)
         => _queues.TryGetValue(queueName, out var q) ? q : null;
+
+    // ═══ 队列持久化（磁盘目录 = 队列身份） ═══
+
+    /// <summary>启动认领：data/ 下每个 QueueCore 都会在队列目录下建一个同名目录（含 .dlq 账本夹）。
+    ///   首启没有目录 → 各队列出厂即建（兜底）；动态新建后的文件夹重启自动认领。</summary>
+    private void LoadExtraQueues(string dataDir)
+    {
+        if (!Directory.Exists(dataDir)) return;
+        foreach (var dir in Directory.GetDirectories(dataDir))
+        {
+            var name = Path.GetFileName(dir);
+            if (_queues.ContainsKey(name)) continue;
+            if (name.EndsWith(".dlq", StringComparison.OrdinalIgnoreCase)) continue;   // 死信账本夹（附属品）
+
+            _queues[name] = new QueueCore(name, PushEvent, dataDir);
+            _queues[name].SetDeadSink(DeliverDead);
+            PushEvent($"📇 [{name}] 磁盘认领：队列目录存在，自动挂账重建");
+        }
+    }
+
+    /// <summary>动态声明队列（HTTP POST /api/q/{queue} 调用）：幂等，注册即落目录盘</summary>
+    public QueueCore DeclareQueue(string queueName)
+    {
+        if (_queues.TryGetValue(queueName, out var existing)) return existing;
+        var q = new QueueCore(queueName, PushEvent, _dataDir);
+        q.SetDeadSink(DeliverDead);
+        _queues[queueName] = q;
+        PushEvent($"🆕 队列声明：{queueName}（主账 + .dlq 死信账本双人套件就绪）");
+        return q;
+    }
+
+    // ═══ 交换机持久化（data/_exchanges.json 快照） ═══
+
+    public void Bind(string exchangeName, string pattern, string queue)
+    {
+        if (!_exchanges.TryGetValue(exchangeName, out var ex))
+            throw new KeyNotFoundException($"不存在交换机 {exchangeName}");
+        var newList = new List<Binding>(ex.Bindings) { new Binding(pattern.Length == 0 ? null : pattern, queue) };
+        _exchanges[exchangeName] = new ExchangeDef(ex.Name, ex.Type, newList);
+        PersistExchanges();
+        PushEvent($"🔗 绑定声明：[{exchangeName}] += {pattern ?? "(fanout)"} → {queue}");
+    }
+
+    public void Unbind(string exchangeName, string pattern, string queue)
+    {
+        if (!_exchanges.TryGetValue(exchangeName, out var ex))
+            throw new KeyNotFoundException($"不存在交换机 {exchangeName}");
+        var newList = ex.Bindings.Where(b => b.Pattern != pattern || b.Queue != queue).ToList();
+        _exchanges[exchangeName] = new ExchangeDef(ex.Name, ex.Type, newList);
+        PersistExchanges();
+        PushEvent($"✂️ 解绑声明：[{exchangeName}] -= {pattern ?? "(fanout)"} ↛ {queue}");
+    }
+
+    private void LoadExchanges(string dataDir)
+    {
+        var path = Path.Combine(dataDir, "_exchanges.json");
+        if (!File.Exists(path)) return;      // 首启：没有快照，出厂表当真相
+        try
+        {
+            var json = File.ReadAllText(path);
+            var load = JsonSerializer.Deserialize<List<ExchangeSnapshot>>(json);
+            if (load is null) return;
+            foreach (var e in load)
+            {
+                _exchanges[e.Name] = new ExchangeDef(e.Name, e.Type,
+                    e.Bindings.Select(b => new Binding(b.Pattern.Length == 0 ? null : b.Pattern, b.Queue)).ToList());
+            }
+            PushEvent($"📇 交换机装载：data/_exchanges.json → {load.Count} 台交换机（含绑定表）");
+        }
+        catch (Exception ex)
+        {
+            PushEvent($"‼️ 交换机快照装载失败（沿用出厂表）：{ex.Message}");
+        }
+    }
+
+    public void PersistExchanges()
+    {
+        var path = Path.Combine(_dataDir, "_exchanges.json");
+        var snapshots = _exchanges.Values.Select(e => new ExchangeSnapshot(
+            e.Name, e.Type,
+            e.Bindings.Select(b => new BindingSnapshot(b.Pattern ?? "", b.Queue)).ToList())).ToList();
+        File.WriteAllText(path, JsonSerializer.Serialize(snapshots, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private sealed record ExchangeSnapshot(string Name, string Type, List<BindingSnapshot> Bindings);
+    private sealed record BindingSnapshot(string Pattern, string Queue);
+
+    /// <summary>某段上未完成的消息（Ready/InFlight）—— GC 重写名单的对外键</summary>
 
     public int Publish(string exchangeName, string? routingKey, string content)
     {

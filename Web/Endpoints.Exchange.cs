@@ -37,5 +37,27 @@ public static class ExchangeEndpoints
 
         app.MapGet("/api/ex", () => Results.Ok(hub.ListExchanges().Select(e =>
             new { e.Name, e.Type, bindings = e.Bindings.Select(b => new { routingKey = b.Pattern, queue = b.Queue }) })));
+
+        // ── 动态绑定声明 / 解绑（持久化：data/_exchanges.json 快照，重启照旧）──
+        app.MapPost("/api/ex/{exchange}/bind", (string exchange, string? pattern, string queue) =>
+        {
+            if (!ClusterOptions.IsWriter)
+                return Results.StatusCode(503);
+            try { hub.Bind(exchange, pattern ?? "", queue); }
+            catch (KeyNotFoundException) { return Results.NotFound(new { error = "不存在交换机", exchange }); }
+            if (hub.Get(queue) is null)
+                // 先绑后建队列也合法：runtime 消息送达时才查 q —— 提示用户可先 POST /api/q/{queue}
+                return Results.Created($"/api/ex/{exchange}/bind", new { bound = true, exchange, pattern = pattern ?? "", queue, warning = "目标队列暂不存在，绑定已留位" });
+            return Results.Created($"/api/ex/{exchange}/bind", new { bound = true, exchange, pattern = pattern ?? "", queue });
+        });
+
+        app.MapPost("/api/ex/{exchange}/unbind", (string exchange, string? pattern, string queue) =>
+        {
+            if (!ClusterOptions.IsWriter)
+                return Results.StatusCode(503);
+            try { hub.Unbind(exchange, pattern ?? "", queue); }
+            catch (KeyNotFoundException) { return Results.NotFound(new { error = "不存在交换机", exchange }); }
+            return Results.Ok(new { unbound = true, exchange, pattern = pattern ?? "", queue });
+        });
     }
 }
