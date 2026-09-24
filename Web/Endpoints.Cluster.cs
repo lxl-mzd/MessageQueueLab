@@ -14,10 +14,12 @@ public static class ClusterEndpoints
     public static void MapClusterApi(this WebApplication app, MessageQueueHub hub)
     {
         // Follower 收 Leader 复制的事件（LogMessage 全体）
+        // v2：身份看 Raft 王位 —— 非当前王（含降级的老王）都接收复制流；
+        //     只有现任王才拒收（防止自己发给自己的事件在环路上落地）
         app.MapPost("/api/cluster/replicate/{queue}", async (string queue, HttpRequest req) =>
         {
-            if (!ClusterOptions.IsFollower)
-                return Results.Conflict(new { error = "仅 follower 节点接收复制", role = ClusterOptions.Role });
+            if (ClusterOptions.Distributed && ClusterOptions.IsWriter)
+                return Results.Conflict(new { error = "当前为 Raft Leader，不接收复制流", role = "Leader" });
 
             var evt = await System.Text.Json.JsonSerializer.DeserializeAsync<LogMessage>(
                 req.Body, SefMqJson.CamelOpts);

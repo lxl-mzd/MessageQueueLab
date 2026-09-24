@@ -15,6 +15,8 @@ public static class ExchangeEndpoints
         // Kafka 对拍：Record 的 key 兼做路由钥匙（未显式指定 routingKey 时用 Key）
         app.MapPost("/api/ex/{exchange}/publish", (string exchange, string? routingKey, MessageBody body) =>
         {
+            if (!ClusterOptions.IsWriter)
+                return Results.StatusCode(503);
             if (string.IsNullOrWhiteSpace(body.Content))
                 return Results.BadRequest(new { error = "content 不能为空" });
 

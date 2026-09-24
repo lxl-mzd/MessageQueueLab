@@ -20,7 +20,7 @@ public static class QueueEndpoints
         // Follower 拒绝业务写（复制流才进数据）
         app.MapPost("/api/q/{queue}/messages", async (string queue, MessageBody body) =>
         {
-            if (ClusterOptions.IsFollower)
+            if (!ClusterOptions.IsWriter)
                 return Results.StatusCode(503);
             if (string.IsNullOrWhiteSpace(body.Content))
                 return Results.BadRequest(new { error = "content 不能为空" });
@@ -63,7 +63,7 @@ public static class QueueEndpoints
 
         app.MapPost("/api/q/{queue}/ack/{id}", async (string queue, string id) =>
         {
-            if (ClusterOptions.IsFollower) return Results.StatusCode(503);
+            if (!ClusterOptions.IsWriter) return Results.StatusCode(503);
             var q = hub.Get(queue);
             if (q is null) return Results.NotFound(new { error = "不存在队列", queue });
 
@@ -90,7 +90,7 @@ public static class QueueEndpoints
 
         app.MapPost("/api/q/{queue}/nack/{id}", async (string queue, string id) =>
         {
-            if (ClusterOptions.IsFollower) return Results.StatusCode(503);
+            if (!ClusterOptions.IsWriter) return Results.StatusCode(503);
             var q = hub.Get(queue);
             if (q is null) return Results.NotFound(new { error = "不存在队列", queue });
 

@@ -19,6 +19,8 @@ public static class DeadLetterEndpoints
         //确认删除/清理指定死信
         app.MapPost("/api/q/{queue}/dlq/{id}/ack", async (string queue, string id) =>
         {
+            if (!ClusterOptions.IsWriter)
+                return Results.StatusCode(503);
             var q = hub.Get(queue);
             if (q is null) return Results.NotFound(new { error = "不存在队列", queue });
 
@@ -33,6 +35,8 @@ public static class DeadLetterEndpoints
         //复活指定死信（重新入队）
         app.MapPost("/api/q/{queue}/dlq/{id}/revive", async (string queue, string id) =>
         {
+            if (!ClusterOptions.IsWriter)
+                return Results.StatusCode(503);
             var q = hub.Get(queue);
             if (q is null) return Results.NotFound(new { error = "不存在队列", queue });
 

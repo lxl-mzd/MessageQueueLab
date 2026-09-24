@@ -32,9 +32,11 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
     p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 
-// ── 集群身份装配（P1/P2）：Leader 持复制器；Follower/单机不挂 ──
+// ── 集群身份装配（v2 动态主权）：分布式下每个节点都持复制器 ——
+//    王位切到谁，谁就朝另外两间发货（ReplicationTargets = MQ_PEERS 剥自己）
+//    单机模式不建复制器
 ClusterReplicator? replicator =
-    ClusterOptions.Role == "leader" ? new ClusterReplicator(ClusterOptions.Followers) : null;
+    ClusterOptions.Distributed ? new ClusterReplicator(ClusterOptions.ReplicationTargets) : null;
 
 builder.Services.AddSingleton(new MessageQueueHub("data", replicator));
 
@@ -61,6 +63,9 @@ if (ClusterOptions.Distributed)
         hub.PushEvent);
 
     raftNode.StartAsync();                    // 启动 Raft loop（心跳/选举）
+
+    // ★ 把王座接进 ClusterOptions：写闸门（IsWriter）与复制流从此跟 Raft 王位联动
+    ClusterOptions.Raft = raftNode;
 }
 
 // ── 步骤 ⑤：5 组路由注册 ──

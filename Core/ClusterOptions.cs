@@ -56,4 +56,29 @@ public static class ClusterOptions
 
     /// <summary>是否处于分布式模式下（leader/follower 都算）</summary>
     public static bool Distributed   => Role is "leader" or "follower";
+
+    /// <summary>复制目的地（v2 动态版）：Raft 全员表剥掉自己 —— 王位在谁身上都朝另外两间发货，
+    ///   不再依赖静态 MQ_FOLLOWERS（老王回归/新王上位都能对）；
+    ///   旧部署没配 MQ_PEERS 时回退 MQ_FOLLOWERS（仅 leader 角色下有值），单机恒为空
+    /// </summary>
+    public static string[] ReplicationTargets
+    {
+        get
+        {
+            if (Peers.Length > 0)
+                return Peers.Where(u => u.Length > 0 && u != SelfUrl).ToArray();
+            if (Role == "follower") return new[] { LeaderUrl };   // 王位切走后也可能临时变王，朝 leader 发
+            return Followers;                                     // 静态模式兼容
+        }
+    }
+
+    // ── v2：动态主权（Raft 王位驱动，MQ_ROLE 只是初始声明） ──
+    /// <summary>Raft 王座引用（Program 装配后注入；单机模式为 null）</summary>
+    public static RaftNode? Raft { get; set; }
+
+    /// <summary>本节点当前是否可受理业务写入 —— 故障转移核心：
+    ///   single → 恒可写；分布式 → 看 Raft 王位（谁当选谁可写，老王回归自动降级后也要 503）
+    /// </summary>
+    public static bool IsWriter
+        => !Distributed || Raft?.Role == RaftRole.Leader;
 }
