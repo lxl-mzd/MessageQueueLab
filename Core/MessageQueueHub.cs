@@ -51,7 +51,21 @@ public class MessageQueueHub
             new Binding("#.error",  "error"),      // 一切 "…error" 收尾的消息进 error 队列
         });
 
-        foreach (var q in _queues.Values) q.Stats();
+        // ── 死信交换机（DLX）：类型 topic，routingKey 约定 "dead.{来源队列}" ──
+        //    队列判死时不再直接写自家 DLQ，而是经此交换机路由（可重绑/可审计）
+        //    默认绑定回各自队列（dead.normal→normal 的 dlq 账本）...
+        _exchanges["dead"] = new ExchangeDef("dead", "topic", new()
+        {
+            new Binding("dead.normal", "normal"),
+            new Binding("dead.vip",    "vip"),
+            new Binding("dead.error",  "error"),
+        });
+
+        foreach (var q in _queues.Values)
+        {
+            q.Stats();
+            q.SetDeadSink(DeliverDead);            // ★ 死信交换机路由钩子注入
+        }
     }
 
     public QueueCore? Get(string queueName)
@@ -78,6 +92,53 @@ public class MessageQueueHub
     }
 
     public List<ExchangeDef> ListExchanges() => _exchanges.Values.ToList();
+
+    // ── 死信交换机执行器（QueueCore.SetDeadSink 挂进来的回调）──
+    //   routingKey = "dead.{来源队列}"，topic 通配匹配 → 命中的绑定队列收 DLQ 投递
+    //   没有任何绑定命中 → 回退：回自家队列的死信账本（不弄丢尸体）
+    public List<LogMessage> DeliverDead(MqMessage deadMsg, string fromQueue)
+    {
+        var events = new List<LogMessage>();
+        var routingKey = $"dead.{fromQueue}";
+
+        if (!_exchanges.TryGetValue("dead", out var dlx))
+        {
+            events.AddRange(_queues[fromQueue].AcceptDeadLetter(deadMsg));
+            return events;
+        }
+
+        var targets = dlx.Type switch
+        {
+            "direct" => dlx.Bindings.Where(b => b.Pattern == routingKey).Select(b => b.Queue).ToList(),
+            "fanout" => dlx.Bindings.Select(b => b.Queue).ToList(),
+            "topic"  => dlx.Bindings.Where(b => b.Matches(routingKey)).Select(b => b.Queue).ToList(),
+            _ => new List<string>(),
+        };
+
+        if (targets.Count == 0)
+        {
+            PushEvent($"🌡️ [DLX dead] routingKey={routingKey} 无绑定命中 → 回退队自家 DLQ");
+            events.AddRange(_queues[fromQueue].AcceptDeadLetter(deadMsg));
+            return events;
+        }
+
+        foreach (var t in targets)
+        {
+            if (t == fromQueue)
+            {
+                // 目标=来源（默认绑定）：直投其死信账本
+                events.AddRange(_queues[t].AcceptDeadLetter(deadMsg));
+            }
+            else
+            {
+                // 跨队列投递：目标收尸 + 来源主账一并销账
+                events.AddRange(_queues[t].AcceptDeadLetter(deadMsg));
+                PushEvent($"↪️ [DLX dead({dlx.Type})] {fromQueue} → routingKey={routingKey} → {t}（跨队列安置）");
+            }
+        }
+        PushEvent($"☠️ [DLX dead({dlx.Type})] 死信自 {fromQueue} → routingKey={routingKey} → {string.Join(',', targets)}（共 {targets.Count} 处）");
+        return events;
+    }
 
     public (int Ready, int Locked, int PendingOnDisk, int DeadLetters) Aggregate()
     {

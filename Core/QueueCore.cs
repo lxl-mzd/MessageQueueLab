@@ -27,8 +27,12 @@ public class QueueCore
     private readonly List<MqMessage> _dead = new();
     private readonly object _dlqLock = new();
     private readonly Action<string> _emit;
+    private Func<MqMessage, string, List<LogMessage>>? _deadSink;   // 死信交换机路由钩子（Hub 装配后注入）
 
     public string QueueName => _queueName;
+
+    /// <summary>装配钩子：Hub 把 DLX 路由函数挂进来（死信不再写死直进自家账本）</summary>
+    public void SetDeadSink(Func<MqMessage, string, List<LogMessage>> sink) => _deadSink = sink;
 
     public QueueCore(string queueName, Action<string> emit, string dataDirectory = "data")
     {
@@ -184,22 +188,28 @@ public class QueueCore
 
         if (retried.RetryCount >= MaxRetryCount)
         {
-            // 💣 死信上限
-            lock (_dlqLock)
-            {
-                if (_dead.Count >= DlqCapacity)
-                {
-                    _ledger.Push("d", null, retried.Id);
-                    return events;   // not full path to DLQ
-                }
-            }
-
-            var e1 = _dlqLedger.Push("e", retried, retried.Id);
-            _dead.Add(retried);
+            // 💣 主账销账（无条件——死信写入哪个 DLQ 由死信交换机决定）
             var e2 = _ledger.Push("d", null, retried.Id);
-            events.Add(e1);
             events.Add(e2);
-            MessageRegistry.MarkDead(_queueName, _dlqLedger.ActiveSegment, _dlqLedger.ActiveLineNo, retried);
+
+            if (_deadSink is not null)
+            {
+                // ══ 走 DLX：死 → dead.{queue} → 绑定命中的目标 DLQ ══
+                events.AddRange(_deadSink(retried, _queueName));
+            }
+            else
+            {
+                // 兜底直投自家 DLQ（solo/测试构造无 Hub 钩子时）
+                lock (_dlqLock)
+                {
+                    if (_dead.Count >= DlqCapacity)
+                        return events;
+                }
+                var e1 = _dlqLedger.Push("e", retried, retried.Id);
+                _dead.Add(retried);
+                events.Add(e1);
+                MessageRegistry.MarkDead(_queueName, _dlqLedger.ActiveSegment, _dlqLedger.ActiveLineNo, retried);
+            }
             _emit($"☠️ [{_queueName}] 消息 {retried.Id[..12]}… 已失败 {retried.RetryCount} 次（原因：{reason}）");
             return events;
         }
@@ -260,6 +270,26 @@ public class QueueCore
 
     // 压缩巡查入口：交给所属 Wal Log 做双门槛判定（段数≥4 / 50% 脏率）
     public void SweepCompaction() => _ledger.SweepCompaction();
+
+    /// <summary>DLX 投递目标：把外来死信收进本队列的死信账本（死信交换机绑定命中后调用）</summary>
+    public List<LogMessage> AcceptDeadLetter(MqMessage msg)
+    {
+        var events = new List<LogMessage>();
+        lock (_dlqLock)
+        {
+            if (_dead.Count >= DlqCapacity)
+            {
+                _emit($"🚧 [{_queueName}] DLQ 已满（{DlqCapacity}），外来死信被拒收（自生自灭）");
+                return events;   // 满仓 → 空 events，调用方主账已自行销账
+            }
+        }
+        var e1 = _dlqLedger.Push("e", msg, msg.Id);
+        _dead.Add(msg);
+        MessageRegistry.MarkDead(_queueName, _dlqLedger.ActiveSegment, _dlqLedger.ActiveLineNo, msg);
+        _emit($"📥 [{_queueName}] DLX 投递：死信 {msg.Id[..12]}… 入驻本队列死信账本");
+        events.Add(e1);
+        return events;
+    }
 
     public void PushExternal(LogMessage evt)
     {
