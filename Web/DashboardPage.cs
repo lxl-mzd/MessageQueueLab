@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════
 // Web/DashboardPage.cs —— 运维看板 v4（单文件零依赖：无 CDN 无外部库）
 //
-//   ① 集群总览：三节点并排卡片（王位/term/计数）+ 全局同步判定
+//   ① 集群总览：三节点并排卡片（角色/term/计数）+ 全局同步判定
 //   ② 单节点视图：每个节点的详细计数 + 运维按钮（健康检查/事件流/冒烟测试）
 //   ③ 死信货架：replicate 到任意 node 的全局死信、复活/删除按钮
 //   ④ 事件流 + 交换机绑定
@@ -105,7 +105,7 @@ public static class DashboardPage
     <div class="scard c-amber"><div class="n" id="ag-locked">–</div><div class="t">🔒 全集群锁定区</div></div>
     <div class="scard c-green"><div class="n" id="ag-disk">–</div><div class="t">📒 全集群主账 SSD</div></div>
     <div class="scard c-rose"><div class="n" id="ag-dead">–</div><div class="t">☠️ 全集群死信</div></div>
-    <div class="scard" style="background:#334155"><div class="n" id="ag-alive">–</div><div class="t">🧭 存活节点 / 王位状态</div></div>
+    <div class="scard" style="background:#334155"><div class="n" id="ag-alive">–</div><div class="t">🧭 存活节点 / Leader 状态</div></div>
   </div>
 
   <h2>🖥️ 服务器节点（每台一份，可逐台操作）</h2>
@@ -123,7 +123,7 @@ public static class DashboardPage
   <table><thead><tr><th>队列</th><th>身份证</th><th>内容</th><th>重试次数</th><th>处置</th></tr></thead>
     <tbody id="dlq-body"></tbody></table>
 
-  <h2>📜 事件流水（最近 200 条 · 来自当前王）</h2>
+  <h2>📜 事件流水（最近 200 条 · 来源当前 Leader 节点）</h2>
   <div id="feed"></div>
   <div class="sub" style="margin-top:12px">数据接口：<code>/health</code> <code>/api/raft/status</code> <code>/api/queues</code> <code>/api/events</code> <code>/api/q/{q}/dlq</code></div>
 </div>
@@ -175,7 +175,7 @@ async function refresh(){
   document.getElementById("ag-disk").textContent=agD;
   document.getElementById("ag-dead").textContent=agDead;
   document.getElementById("ag-alive").innerHTML = '<span style="color:'+(kingN===1?'#86efac':'#fca5a5')+'">'
-    + aliveN+'/'+rows.length+' 在线 · '+(kingN===1?'王位正常':'王位异常!')+'</span>';
+    + aliveN+'/'+rows.length+' 在线 · '+(kingN===1?'Leader unique':'Leader missing or multiple')+'</span>';
 
   // 节点卡片
   const grid = document.getElementById("nodegrid"); grid.innerHTML="";
@@ -277,7 +277,7 @@ async function readNode(p){
     lines.push("👤 节点：" + (rJson.node||"–"));
     lines.push("🎖️ 角色：" + (rJson.role||"–"));
     lines.push("🔢 任期 term：" + (rJson.term ?? "–"));
-    lines.push("🎯 跟随王：" + (rJson.leaderId||"–"));
+    lines.push("🎯 Leader 节点：" + (rJson.leaderId||"–"));
     if (rJson.peers) lines.push("🧭 peers：" + rJson.peers.join(", "));
   } catch(e){ lines.push("raft/status 无法解析"); }
   openModal(":"+p+" · 健康检查", lines.join("\n"));
@@ -309,9 +309,9 @@ async function showClusterStatus(){
     if (s.queues) lines.push("📊 队列：就绪 " + (s.queues.ready??0) + " / 锁定 " + (s.queues.locked??0)
                           + " / 主账 " + (s.queues.pendingOnDisk??0) + " / 死信 " + (s.queues.deadLetters??0));
     lines.push("");
-    lines.push("提示：当前王位以各节点「Raft 状态」卡为准（动态主权）。");
+    lines.push("提示：当前 Leader 以各节点「Raft 状态」卡为准（Raft 选主，动态漂移）。");
   } catch(e){ lines.push("数据解析失败"); }
-  openModal("集群聚合状态（当前王视角）", lines.join("\n"));
+  openModal("集群聚合状态（当前 Leader 视角）", lines.join("\n"));
 }
 
 /* ── 弹窗 ── */
