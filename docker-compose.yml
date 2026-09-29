@@ -10,7 +10,7 @@ services:
     build: .
     environment:
       MQ_ROLE: leader
-      MQ_NODE_NAME: node-leader
+      MQ_NODE_NAME: node-1
       MQ_SELF: "http://mq-leader:8080"
       MQ_PEERS: *mq-peers
       MQ_FOLLOWERS: "http://mq-follower-1:8080,http://mq-follower-2:8080"
@@ -24,7 +24,7 @@ services:
     image: mq-lab:17
     environment:
       MQ_ROLE: follower
-      MQ_NODE_NAME: node-follower-1
+      MQ_NODE_NAME: node-2
       MQ_SELF: "http://mq-follower-1:8080"
       MQ_PEERS: *mq-peers
       MQ_LEADER_URL: "http://mq-leader:8080"
@@ -37,7 +37,7 @@ services:
     image: mq-lab:17
     environment:
       MQ_ROLE: follower
-      MQ_NODE_NAME: node-follower-2
+      MQ_NODE_NAME: node-3
       MQ_SELF: "http://mq-follower-2:8080"
       MQ_PEERS: *mq-peers
       MQ_LEADER_URL: "http://mq-leader:8080"

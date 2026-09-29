@@ -96,7 +96,7 @@ public static class DashboardPage
     <select id="interval" onchange="resetTimer()">
       <option value="5000">5s</option><option value="15000" selected>15s</option><option value="60000">60s</option>
     </select>
-    <button class="btn btn-teal" onclick="showClusterStatus()">🧭 集群详情 JSON</button>
+    <button class="btn btn-teal" onclick="showClusterStatus()">🧮 集群速览</button>
   </div>
 
   <!-- 集群汇总条 -->
@@ -182,7 +182,6 @@ async function refresh(){
   rows.forEach(r=>{
     const role = r.raft ? (r.raft.role||"Down") : "Down";
     const cls  = role==="Leader"?"b-king":(role==="Follower"?"b-follower":(role==="Candidate"?"b-candidate":"b-dead"));
-    const badge= role==="Leader"?"👑 王":(role==="Follower"?"🧑‍✈️ Follower":(role==="Candidate"?"🗳️ 选举中":"💤 下线"));
     const div=document.createElement("div"); div.className="node";
     div.innerHTML =
       '<div class="hdr" style="display:flex;justify-content:space-between;align-items:center">'
@@ -253,7 +252,7 @@ async function refresh(){
   });
 }
 function badgeText(role){
-  return role==="Leader"?"👑 王":(role==="Follower"?"跟随者":(role==="Candidate"?"竞选人":"⚠️ 联络不上"));
+  return role;   // 直接 Leader / Follower / Candidate / Down
 }
 
 /* ── 运维按钮 ── */
@@ -267,7 +266,21 @@ async function readNode(p){
   const [h, r] = await Promise.all([
     jget("http://"+location.hostname+":"+p, "/health"),
     jget("http://"+location.hostname+":"+p, "/api/raft/status")]);
-  openModal("节点 :"+p+" · 健康检查", "health  →  "+(h.body||'(无响应)')+"\n\nraft/status  →  "+r.body);
+  let lines = [];
+  try {
+    const hJson = JSON.parse(h.body||"{}");
+    lines.push((hJson && hJson.status==="alive") ? "🩺 服务存活" : "🩺 服务无响应");
+    if (hJson && hJson.now) lines.push("🕒 服务器时间：" + hJson.now);
+  } catch(e){ lines.push("🩺 /health 无法解析"); }
+  try {
+    const rJson = JSON.parse(r.body||"{}");
+    lines.push("👤 节点：" + (rJson.node||"–"));
+    lines.push("🎖️ 角色：" + (rJson.role||"–"));
+    lines.push("🔢 任期 term：" + (rJson.term ?? "–"));
+    lines.push("🎯 跟随王：" + (rJson.leaderId||"–"));
+    if (rJson.peers) lines.push("🧭 peers：" + rJson.peers.join(", "));
+  } catch(e){ lines.push("raft/status 无法解析"); }
+  openModal(":"+p+" · 健康检查", lines.join("\n"));
 }
 async function eventsNode(p){
   const r = await jget("http://"+location.hostname+":"+p, "/api/events");
@@ -287,7 +300,18 @@ async function probeNode(p){
 async function showClusterStatus(){
   const p = NODES()[0];
   const r = await jget("http://"+location.hostname+":"+p, "/api/cluster/status");
-  openModal("集群聚合状态（当前王视角）", JSON.stringify(JSON.parse(r.body||"{}"), null, 2));
+  let lines = [];
+  try {
+    const s = JSON.parse(r.body||"{}");
+    if (s.role) lines.push("🎖️ 本机角色（静态声明）：" + s.role);
+    if (s.node) lines.push("👤 节点：" + s.node);
+    if (s.peers && s.peers.length) lines.push("🧭 peers：" + s.peers.join(", "));
+    if (s.queues) lines.push("📊 队列：就绪 " + (s.queues.ready??0) + " / 锁定 " + (s.queues.locked??0)
+                          + " / 主账 " + (s.queues.pendingOnDisk??0) + " / 死信 " + (s.queues.deadLetters??0));
+    lines.push("");
+    lines.push("提示：当前王位以各节点「Raft 状态」卡为准（动态主权）。");
+  } catch(e){ lines.push("数据解析失败"); }
+  openModal("集群聚合状态（当前王视角）", lines.join("\n"));
 }
 
 /* ── 弹窗 ── */
