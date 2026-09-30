@@ -89,4 +89,20 @@ app.StartSweeper(hub);                      // 巡查员后台线程（含TTL、
 hub.PushEvent($"🚾 集群节点就绪（role={ClusterOptions.Role} node={ClusterOptions.NodeName}）");
 hub.PushEvent("⏳ Raft 开始心跳/选举");
 
+// ── 步骤 ⑥：优雅下线（SIGTERM → .NET ApplicationStopping → leave → 退出）──
+//    K8s 缩容时发 SIGTERM，我们利用这 20 秒 grace period 处理 leave：
+//      · Leader → LeaveMemberAsync(self)：m 事件去掉自己 → 剩余成员重选王
+//      · Follower → 向当前 Leader 发 /api/raft/leave {node: 自己}
+//    （不再依赖镜像里的 wget/curl/exec preStop —— .NET 自己管理生命周期）
+var lifetime2 = app.Services.GetRequiredService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>();
+lifetime2.ApplicationStopping.Register(() =>
+{
+    try
+    {
+        if (raftNode == null) return;
+        raftNode.GracefulOfflineAsync().GetAwaiter().GetResult();   // 同步等最多 ~5s（gracePeriod 内）
+    }
+    catch { /* 退出路径中的异常不再阻塞 */ }
+});
+
 app.Run();

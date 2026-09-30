@@ -471,13 +471,18 @@ public sealed class RaftNode : IDisposable
                 var snapResp = await _http.GetAsync($"{leaderUrl}/api/raft/snapshot");
                 if (!snapResp.IsSuccessStatusCode) { await Task.Delay(3000); continue; }
                 var snapBody = await snapResp.Content.ReadAsStringAsync();
-                var snap = System.Text.Json.JsonSerializer.Deserialize<MessageQueueLab.Core.MessageQueueHub.ClusterSnapshotBody>(snapBody);
-                if (snap is null) { await Task.Delay(3000); continue; }
+                // Leader 返回的 JSON 键是 camelCase（"queues"），反序列化需要大小写不敏感
+                var snap = System.Text.Json.JsonSerializer.Deserialize<MessageQueueLab.Core.MessageQueueHub.ClusterSnapshotBody>(snapBody,
+                    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (snap is null || snap.Queues is null) { await Task.Delay(3000); continue; }
 
                 // ③ 应用快照到本节点各队列（hub 内部逐个 QueueCore restore）
                 hub.ApplySnapshot(snap);
 
-                // ④ 通知 Leader 追平完成
+                // ④ 自身追平转正（在 sync-ack 之前——确保 Leader 全量复制到来时本节点已 ready）
+                MarkSynced(true);
+
+                // ⑤ 通知 Leader 追平完成
                 await _http.PostAsJsonAsync($"{leaderUrl}/api/raft/sync-ack", new { node = _nodeId, synced = true });
 
                 _emit?.Invoke($"🎉 [raft:{_nodeId}] join + catch-up 完成（成员表 seq={snap.MemberSeq}）—— 正式入列");
@@ -527,5 +532,53 @@ public sealed class RaftNode : IDisposable
             _membership.Apply(seq, newTable);
         }
         return (ok2, ok2 ? "" : $"Quorum 未达（{total}/{required}）：{string.Join(',', targets)}");
+    }
+
+    /// <summary>
+    /// SIGTERM / preStop 时的优雅下线：
+    ///   · 我是 Leader → LeaveMemberAsync(self)：m 事件去掉自己 → 剩余成员重选王
+    ///   · 我是 Follower → 向已知 Leader 发 /api/raft/leave {node: 自己}
+    ///   · 失败则静默退出（WAL 在 PVC 里，重启时回放恢复，由 ops 手动清僵尸成员）
+    /// </summary>
+    public async Task GracefulOfflineAsync()
+    {
+        lock (_raftLock)
+        {
+            if (_leaving || !_synced) return;   // 已经下线中 / 还不是正式成员（join 模式未追平）→ 静默退出
+        }
+        // 不预占 _leaving —— 让 LeaveMemberAsync 自己管理 _leaving，否则它会被自己给卡死
+
+        try
+        {
+            if (_role == RaftRole.Leader)
+            {
+                await LeaveMemberAsync(_nodeId);
+                _emit?.Invoke($"🚪 [raft:{_nodeId}] Leader 优雅下线：m 事件已 Quorum，剩余成员重选王中");
+                // 给新王选举留 3 秒缓冲（我们的选举超时 2~4.5s）
+                await Task.Delay(3000);
+            }
+            else
+            {
+                // Follower：向当前 Leader 发 leave 请求（Leader 会替我们走 Quorum）
+                string? leaderUrl = null;
+                lock (_raftLock) leaderUrl = _membership.Table.FirstOrDefault(m => m.Node == _leaderId_)?.Url;
+                if (!string.IsNullOrEmpty(leaderUrl))
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    using var resp = await _http.PostAsJsonAsync(
+                        $"{leaderUrl}/api/raft/leave", new { node = _nodeId },
+                        cancellationToken: cts.Token);
+                    _emit?.Invoke(resp.IsSuccessStatusCode
+                        ? $"🚪 [raft:{_nodeId}] Follower 优雅下线：Leader 已处理 leave"
+                        : $"🚪 [raft:{_nodeId}] Follower leave 失败 ({resp.StatusCode})，静默退出");
+                }
+                else
+                    _emit?.Invoke($"🚪 [raft:{_nodeId}] 下线：无已知 Leader，静默退出");
+            }
+        }
+        catch (Exception ex)
+        {
+            _emit?.Invoke($"🚪 [raft:{_nodeId}] 优雅下线异常（静默跳过）：{ex.Message}");
+        }
     }
 }

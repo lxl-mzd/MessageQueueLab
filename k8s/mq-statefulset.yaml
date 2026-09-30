@@ -4,13 +4,14 @@
 #   · 每个 Pod 独立 PVC 持久化（WAL/死信/成员表快照全在卷上）
 #   · MQ_SELF 用 $(POD_NAME) 对 headless 的 dns 拼接（k8s env 支持变量内插）
 #   · MQ_PEERS 是初始 3 员表（新 Pod 加入用 MQ_LEADER_URL + join 协议自身上报）
-#   · lifecycle.preStop: 优雅下线（先 leave 再 sleep，让 K8s 杀 Pod）
+#   · 优雅下线：SIGTERM → .NET ApplicationStopping → RaftNode.GracefulOfflineAsync()
+#     （k8s lifecycle.preStop 已移除 — 容器里没有 wget/curl，改走 SIGTERM 链路）
 #   · imagePullPolicy: IfNotPresent —— 我们首选本地镜像 mq-lab:18
 #     （K8s 会用 docker-desktop 节点里的 mq-lab:18 镜像，没网络也能跑）
 #
 #   扩容：kubectl scale --replicas=4 statefulset/mq   （新 Pod 会自己 join+catch-up）
-#   缩容：kubectl scale --replicas=2 statefulset/mq   （StatefulSet 先杀最高序号，
-#         我们的 preStop 钩子先发 leave 再退出，集群余下的节点赢得 quorum）
+#   缩容：kubectl scale --replicas=2 statefulset/mq   （SIGTERM → GracefulOfflineAsync；StatefulSet
+#         先杀最高序号， .NET ApplicationStopping 发 leave 后退出，集群余下节点赢得 quorum）
 # ═══════════════════════════════════════════════════════════════
 apiVersion: apps/v1
 kind: StatefulSet
@@ -72,11 +73,8 @@ spec:
               port: 8080
             initialDelaySeconds: 10
             periodSeconds: 10
-          # 优雅下线：K8s 打 lifecycle.preStop → leave → sleep
-          lifecycle:
-            preStop:
-              exec:
-                command: [ "sh", "-c", "wget -qO- -X POST http://localhost:8080/api/raft/leave || true; sleep 5" ]
+          # 优雅下线：SIGTERM → .NET ApplicationStopping → RaftNode.GracefulOfflineAsync()
+          # （容器里没有 wget/curl，lifecycle.preStop 的 exec 方案已移除）
           resources:
             requests:
               cpu: 250m
