@@ -18,6 +18,7 @@
 //     · 事件内携带 Seq 全序号（全局单调递增），follower 判断是否重复投递
 //     · follower 收到旧 Seq 直接丢弃，不算重复（AppendLedger 本身天然消重）
 // ═══════════════════════════════════════════════════════════════
+using System.Collections.Concurrent;
 using System.Net.Http.Json;
 using System.Text.Json;
 using MessageQueueLab.Models;
@@ -71,6 +72,16 @@ public class ClusterReplicator
                                                         : Math.Max(1, targets.Length / 2 + 1);
         var totalMembers = raft is not null ? raft.MemberCount : targets.Length + 1;
 
+        // ── Delta buffer：Syncing 成员的追赶事件种入缓冲队列（Leader 不丢任何事件）──
+        if (raft is not null)
+        {
+            foreach (var (node, url) in raft.GetSyncingMembers())
+            {
+                var dq = _pendingDelta.GetOrAdd(node, _ => new ConcurrentQueue<(string, LogMessage)>());
+                dq.Enqueue((queue, evt));
+            }
+        }
+
         // 并行传感器：每个 follower 一张“回执票”（POST；返回成功=真回执）
         var tasks = targets.Select(async f =>
         {
@@ -89,6 +100,45 @@ public class ClusterReplicator
         ackedBy.AddRange(done.Where(x => x != null).Cast<string>());
 
         return new ReplicationResult(ackedBy.Count + 1, totalMembers, ackedBy);
+    }
+
+    // ── Delta replay（catch-up 结束后回溯补发） ──
+    //    每个 Syncing 成员一份队列：join 起始时开始 buffer → sync-ack 后一次性补发 → 清空
+    private readonly ConcurrentDictionary<string, ConcurrentQueue<(string Queue, LogMessage Evt)>> _pendingDelta = new();
+
+    /// <summary>
+    /// Leader 收到 sync-ack 后调用：把 Buffer 中此成员的所有积压事件按序补发。
+    /// 返回补发条数。失败则中途停（剩余事件留队，可再次调用重试）。
+    /// </summary>
+    public async Task<int> ReplayDeltaToFollower(string followerNode, string followerUrl)
+    {
+        if (!_pendingDelta.TryRemove(followerNode, out var deltaQueue) || deltaQueue.IsEmpty)
+        {
+            _pendingDelta.TryRemove(followerNode, out _);   // 确认清干净
+            return 0;
+        }
+
+        var replayed = 0;
+        while (deltaQueue.TryDequeue(out var item))
+        {
+            try
+            {
+                using var resp = await _http.PostAsJsonAsync(
+                    $"{followerUrl}/api/cluster/replicate/{item.Queue}", item.Evt);
+                if (!resp.IsSuccessStatusCode) { deltaQueue.Enqueue(item); break; }   // 失败：塞回去，退出
+                replayed++;
+            }
+            catch
+            {
+                deltaQueue.Enqueue(item);   // 网络故障：塞回去 = 剩余留给下次
+                break;
+            }
+        }
+
+        // 队列里剩余的事件如果已经全发完了清空
+        if (deltaQueue.IsEmpty) _pendingDelta.TryRemove(followerNode, out _);
+
+        return replayed;
     }
 }
 

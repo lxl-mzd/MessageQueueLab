@@ -24,6 +24,7 @@ public class MessageQueueHub
     private readonly object _eventLock = new();
     private readonly List<(DateTime Ts, string Msg)> _events = new();
     private readonly ClusterReplicator? _replicator;
+    public ClusterReplicator? Replicator => _replicator;     // catch-up delta replay 给 Leader 的 sync-ack 端点用
     private readonly string _dataDir;
 
     public MessageQueueHub(string dataDirectory = "data", ClusterReplicator? replicator = null)

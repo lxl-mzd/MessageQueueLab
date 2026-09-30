@@ -115,14 +115,27 @@ public static class RaftEndpoints
         });
 
         // sync-ack：新挂成员在 catch-up 完成后上报自身状态
+        //   v5：接受其他成员的 sync-ack（Leader 记 Switch 到 member 表的 per-node _syncFlags）
+        //     → 同时触发 ClusterReplicator 的 Delta Replay（buffer 的追赶事件补发给该节点）
         app.MapPost("/api/raft/sync-ack", (System.Text.Json.JsonElement body) =>
         {
+            var nodeName = body.TryGetProperty("node", out var n) ? n.GetString() ?? "" : raft.NodeId;
             bool synced = body.TryGetProperty("synced", out var s) && s.GetBoolean();
-            var nodeName = body.TryGetProperty("node", out var n) ? n.GetString()! : raft.NodeId;
-            if (!string.Equals(nodeName, raft.NodeId, StringComparison.OrdinalIgnoreCase))
-                return Results.Conflict(new { error = "跟随节点没有图 Own self Sync 状态变更请求（它只对自己）", but = nodeName });
-            raft.MarkSynced(synced);
-            return Results.Ok(new { synced, role = raft.Role.ToString() });
+
+            // ① 记录成员同步水位（Leader 视角 per-member 追踪）
+            raft.SetMemberSynced(nodeName, synced);
+
+            // ② 触发 Delta replay：把 join→sync-ack 之间的积压事件补发给该新成员
+            if (synced && hub.Replicator is not null)
+            {
+                var targetUrl = raft.Members.FirstOrDefault(m => m.Node == nodeName).Url;
+                if (!string.IsNullOrWhiteSpace(targetUrl))
+                {
+                    _ = hub.Replicator.ReplayDeltaToFollower(nodeName, targetUrl);   // fire-and-forget 异步补发
+                }
+            }
+
+            return Results.Ok(new { synced, node = nodeName });
         });
 
         // write-ready：k8s write Service 的 readinessProbe（非 Leader 503 → Service 端点自动只指王）

@@ -441,6 +441,32 @@ public sealed class RaftNode : IDisposable
             : $"🧪 [raft:{_nodeId}] 进入 Syncing 状态（历史快照追赶中）");
     }
 
+    /// <summary>Leader 视角：标记某个成员的同步状态（由该成员的 sync-ack RPC 触发）。</summary>
+    public void SetMemberSynced(string node, bool value)
+    {
+        lock (_raftLock)
+        {
+            var old = _syncFlags.TryGetValue(node, out var v) ? v : true;
+            if (old != value)
+            {
+                _syncFlags[node] = value;
+                _emit?.Invoke(value
+                    ? $"🧪 [raft:{_nodeId}] {node} catch-up 完成 → 加入 Quorum 票池"
+                    : $"🧪 [raft:{_nodeId}] {node} 标记为 Syncing（退出 Quorum）");
+            }
+        }
+    }
+
+    /// <summary>当前处于 Syncing 状态的成员列表（Leader 视角，供 Cor 的 Delta Buffer 使用）。</summary>
+    public List<(string Node, string Url)> GetSyncingMembers()
+    {
+        lock (_raftLock)
+            return _membership.Table
+                .Where(m => m.Node != _nodeId && !_syncFlags.GetValueOrDefault(m.Node, true))
+                .Select(m => (m.Node, m.Url))
+                .ToList();
+    }
+
     /// <summary>本节点成员表是否为空（判"新节点 join 模式"的唯一证据）</summary>
     public bool NeedsJoinAtBoot { get { lock (_raftLock) return _membership.Table.Count == 0; } }
     /// <summary>
@@ -553,9 +579,35 @@ public sealed class RaftNode : IDisposable
             if (_role == RaftRole.Leader)
             {
                 await LeaveMemberAsync(_nodeId);
-                _emit?.Invoke($"🚪 [raft:{_nodeId}] Leader 优雅下线：m 事件已 Quorum，剩余成员重选王中");
-                // 给新王选举留 3 秒缓冲（我们的选举超时 2~4.5s）
-                await Task.Delay(3000);
+
+                // ── 轮询确认新王已选出（代替瞎等 3 秒）──
+                //  新成员表（去掉自己后）里剩余的成员 URL 列表
+                var remainingUrls = _membership.Table
+                    .Where(m => m.Node != _nodeId)
+                    .Select(m => m.Url)
+                    .ToList();
+
+                var confirmed = false;
+                for (var poll = 0; poll < 15 && !confirmed; poll++)   // 最多 7.5 秒
+                {
+                    await Task.Delay(500);
+                    foreach (var url in remainingUrls)
+                    {
+                        try
+                        {
+                            var body = await _http.GetStringAsync($"{url}/api/raft/status");
+                            if (body.Contains("\"role\":\"Leader\""))
+                            {
+                                _emit?.Invoke($"🚪 [raft:{_nodeId}] 已确认新 Leader 在 {ExtractHost(url)} → 安全退出");
+                                confirmed = true;
+                                break;
+                            }
+                        }
+                        catch { /* 该成员尚未就绪，轮询下一个 */ }
+                    }
+                }
+                if (!confirmed)
+                    _emit?.Invoke($"⚠️ [raft:{_nodeId}] 轮询 7.5s 内未确认新 Leader，按 Raft 协议自主收敛后仍然退出");
             }
             else
             {
