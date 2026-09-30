@@ -100,6 +100,7 @@ public sealed class RaftNode : IDisposable
         // "http://node-1:8080" → "node-1"；"http://mq-0.mq-headless.default.svc:8080" → "mq-0.mq-headless.default.svc"
         var rest = url.Replace("http://", "").Replace("https://", "");
         var host = rest.Split('/')[0];
+        return host.Split('.')[0];   // k8s 的 DNS "mq-0.mq-headless..." 截第一段 = "mq-0"; compose 域名 "node-1:8080" 本身无点保持原样
         var colon = host.IndexOf(':');
         return colon >= 0 ? host[..colon] : host;
     }
@@ -119,15 +120,16 @@ public sealed class RaftNode : IDisposable
 
         var table = new List<Persistence.RaftMember>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        bool selfInPeers = bootstrapPeerUrls.Any(u => string.Equals(ExtractHost(u), _nodeId, StringComparison.OrdinalIgnoreCase));
         if (_membership.Table.Count > 0)
         {
             // ── 磁盘回放（kv 恢复路径）──
             table.AddRange(_membership.Table);
             _emit?.Invoke($"📇 [raft:{_nodeId}] 成员表回放（{_membership.Table.Count} 人）");
         }
-        else if (bootstrapPeerUrls.Length == 0)
+        else if (bootstrapPeerUrls.Length == 0 || !selfInPeers)
         {
-            // ── join 模式：bootstrapPeers 为空（新节点不带成员表启动）→ 不自封为王，等 join 通告
+            // ── join 模式：MQ_PEERS 不含自己的名字（新节点不带成员表启动）→ 不自封为王，等 join 通告
             _synced = false;
             _emit?.Invoke($"🧪 [raft:{_nodeId}] join 模式：空成员表启动，等待 join 通告后 catch-up");
             _electionTimeoutMs = _rand.Next(2000, 4500);

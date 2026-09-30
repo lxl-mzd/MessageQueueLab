@@ -1,0 +1,20 @@
+# ═══════════════════════════════════════════════════════════════
+# k8s/mq-headless.yaml —— 无头 Service：各 Pod 稳定 DNS（mq-i）
+#   Pod 名 = mq-0 / mq-1 / mq-2 / ...
+#   每个 Pod 内 MQ_SELF 直指自己的 headless DNS
+# ═══════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: Service
+metadata:
+  name: mq-headless
+spec:
+  clusterIP: None
+  # 关键开关：not-ready 的 Pod 也注册 DNS —— 否则 3 个 follower 都 not-ready（等 Leader）
+  # 时互相 ping 不到，永远选不出王（鸡生蛋死锁）
+  publishNotReadyAddresses: true
+  selector:
+    app: mqlab
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

@@ -1,0 +1,94 @@
+# ═══════════════════════════════════════════════════════════════
+# k8s/mq-statefulset.yaml —— 消息队列 · StatefulSet
+#
+#   · 每个 Pod 独立 PVC 持久化（WAL/死信/成员表快照全在卷上）
+#   · MQ_SELF 用 $(POD_NAME) 对 headless 的 dns 拼接（k8s env 支持变量内插）
+#   · MQ_PEERS 是初始 3 员表（新 Pod 加入用 MQ_LEADER_URL + join 协议自身上报）
+#   · lifecycle.preStop: 优雅下线（先 leave 再 sleep，让 K8s 杀 Pod）
+#   · imagePullPolicy: IfNotPresent —— 我们首选本地镜像 mq-lab:18
+#     （K8s 会用 docker-desktop 节点里的 mq-lab:18 镜像，没网络也能跑）
+#
+#   扩容：kubectl scale --replicas=4 statefulset/mq   （新 Pod 会自己 join+catch-up）
+#   缩容：kubectl scale --replicas=2 statefulset/mq   （StatefulSet 先杀最高序号，
+#         我们的 preStop 钩子先发 leave 再退出，集群余下的节点赢得 quorum）
+# ═══════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mq
+spec:
+  podManagementPolicy: Parallel
+  serviceName: mq-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mqlab
+  template:
+    metadata:
+      labels:
+        app: mqlab
+    spec:
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: mq
+          image: mq-lab:18
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            # ① Pod 名 (mq-0 / mq-1 / ...)
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # ②Raft的节点名 = Pod 名
+            - name: MQ_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # ③ 本节点的对外 URL（用 headless DNS）
+            - name: MQ_SELF
+              value: "http://$(POD_NAME).mq-headless.default.svc.cluster.local:8080"
+            # ④ Raft 全员表（初始 3 员；新节点 join 模式走 MQ_LEADER_URL）
+            - name: MQ_PEERS
+              value: "http://mq-0.mq-headless.default.svc.cluster.local:8080,http://mq-1.mq-headless.default.svc.cluster.local:8080,http://mq-2.mq-headless.default.svc.cluster.local:8080"
+            # ⑤ MQ_LEADER_URL：扩容节点 (mq-3+) 的自动 join 目标 —— 用 mq-write Service（自动指王）
+            - name: MQ_LEADER_URL
+              value: "http://mq-write.default.svc.cluster.local:8080"
+            # ⑤ MQ_ROLE（只需要是 leader/follower 才能进入 Distributed 模式；动态主权由 Raft 决定）
+            - name: MQ_ROLE
+              value: "leader"
+            # ⑥ 业务写入口检查 check（Leader 的 readiness 探针）
+          readinessProbe:
+            httpGet:
+              path: /api/raft/write-ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          # 优雅下线：K8s 打 lifecycle.preStop → leave → sleep
+          lifecycle:
+            preStop:
+              exec:
+                command: [ "sh", "-c", "wget -qO- -X POST http://localhost:8080/api/raft/leave || true; sleep 5" ]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          volumeMounts:
+            - name: wal
+              mountPath: /app/data
+  volumeClaimTemplates:
+    - metadata:
+        name: wal
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
