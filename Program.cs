@@ -52,20 +52,29 @@ if (ClusterOptions.Distributed)
     // Raft 全体成员表：优先用 MQ_PEERS（每个节点都要知道全部 3 个成员——含自身，
     // 否则 follower 之间互不相识 → 两个小选区各自选出 Leader → 集群分裂）
     // MQ_SELF = 本节点身份证，RaftNode 用它把"自己"从 peers 里剥掉（不投自己不干扰）
+    // Raft 全体成员表：优先用 MQ_PEERS（每个节点都要知道全部 3 个成员——含自身，
+    // 否则 follower 之间互不相识 → 两个小选区各自选出 Leader → 集群分裂）
+    // 若 MQ_PEERS 为空：新节点（join 模式）不预设任何 peers，只靠"自我 join 上报后由 King 通知"。
+    // （注意：不 fallback localhost —— 那会让 join 模式的节点误认为自己有一个 2 人小集群）
     var peerUrls = ClusterOptions.Peers.Length > 0
         ? ClusterOptions.Peers
-        : new[] { "http://localhost:8080" }.Concat(ClusterOptions.Followers).ToArray();
+        : Array.Empty<string>();
 
     raftNode = new RaftNode(
         ClusterOptions.NodeName,
         ClusterOptions.SelfUrl,
         peerUrls.Where(p => p.Length > 0).ToArray(),
+        "data",     // members.json 与 WAL 数据目录同根（_cluster/ 子夹）
         hub.PushEvent);
 
     raftNode.StartAsync();                    // 启动 Raft loop（心跳/选举）
 
     // ★ 把王座接进 ClusterOptions：写闸门（IsWriter）与复制流从此跟 Raft 王位联动
     ClusterOptions.Raft = raftNode;
+
+    // ★ 新节点自助 join-on-boot（空成员表 + 配置了 join URL）：异步等 Leader 通过后 catch-up
+    if (raftNode.NeedsJoinAtBoot && ClusterOptions.LeaderUrl.Length > 0)
+        _ = raftNode.StartJoinAndCatchUpAsync(ClusterOptions.LeaderUrl, hub);
 }
 
 // ── 步骤 ⑤：5 组路由注册 ──

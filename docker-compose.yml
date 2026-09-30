@@ -1,46 +1,47 @@
-# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-#  鑷€犳秷鎭槦鍒?路 涓夎妭鐐?Raft 闆嗙兢
-#  MQ_PEERS = Raft 鍏ㄤ綋鎴愬憳琛紙姣忎釜鑺傜偣蹇呴』鐭ラ亾鍏ㄩ儴 3 涓垚鍛橈紝鍚嚜韬€斺€?#             鍚﹀垯 follower 涔嬮棿浜掍笉鐩歌瘑锛屼細鍒嗚鍑哄弻 Leader锛?#  MQ_FOLLOWERS = Leader 澶嶅埗鐩爣锛汳Q_LEADER_URL = Leader 涓氬姟鍏ュ彛
-#  MQ_ROLE = leader/follower锛堝啓鍙?澶嶅埗鍙ｏ紝鍚庣画 Raft 涓婁綅鎺ョ锛?# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-x-mq-peers: &mq-peers "http://mq-leader:8080,http://mq-follower-1:8080,http://mq-follower-2:8080"
+# ==========================================================
+# 自造消息队列 · 三节点 Raft 集群
+#   node-1 / node-2 / node-3（节点名和容器 DNS 一致， raft 成员表自动生成）
+#   MQ_PEERS = Raft 全员表（每节点都要写全 3 员，含自身）
+#   MQ_ROLE = leader/follower（动态主权下只影响初始写入口；Raft 王位接管后以王为准）
+# ==========================================================
+x-mq-peers: &mq-peers "http://node-1:8080,http://node-2:8080,http://node-3:8080"
 
 services:
-  mq-leader:
-    image: mq-lab:17
+  node-1:
+    image: mq-lab:18
     build: .
     environment:
       MQ_ROLE: leader
       MQ_NODE_NAME: node-1
-      MQ_SELF: "http://mq-leader:8080"
+      MQ_SELF: "http://node-1:8080"
       MQ_PEERS: *mq-peers
-      MQ_FOLLOWERS: "http://mq-follower-1:8080,http://mq-follower-2:8080"
-      MQ_LEADER_URL: "http://mq-leader:8080"
+      MQ_LEADER_URL: "http://node-1:8080"
     ports:
       - "5081:8080"
     volumes:
       - mqlab-leader:/app/data
 
-  mq-follower-1:
-    image: mq-lab:17
+  node-2:
+    image: mq-lab:18
     environment:
       MQ_ROLE: follower
       MQ_NODE_NAME: node-2
-      MQ_SELF: "http://mq-follower-1:8080"
+      MQ_SELF: "http://node-2:8080"
       MQ_PEERS: *mq-peers
-      MQ_LEADER_URL: "http://mq-leader:8080"
+      MQ_LEADER_URL: "http://node-1:8080"
     ports:
       - "5082:8080"
     volumes:
       - mqlab-follower-1:/app/data
 
-  mq-follower-2:
-    image: mq-lab:17
+  node-3:
+    image: mq-lab:18
     environment:
       MQ_ROLE: follower
       MQ_NODE_NAME: node-3
-      MQ_SELF: "http://mq-follower-2:8080"
+      MQ_SELF: "http://node-3:8080"
       MQ_PEERS: *mq-peers
-      MQ_LEADER_URL: "http://mq-leader:8080"
+      MQ_LEADER_URL: "http://node-1:8080"
     ports:
       - "5083:8080"
     volumes:

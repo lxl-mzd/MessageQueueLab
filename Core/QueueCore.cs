@@ -271,6 +271,36 @@ public class QueueCore
     // 压缩巡查入口：交给所属 Wal Log 做双门槛判定（段数≥4 / 50% 脏率）
     public void SweepCompaction() => _ledger.SweepCompaction();
 
+    // ═══ catch-up 快照（新节点 join 场景，由 Leader 侧的 ApplySnapshot 调用） ═══
+
+    public (List<(long Seq, MqMessage Msg)> Items, long UptoSeq) CaptureLedgerSnapshot()
+        => (_ledger.SnapshotWithSeq(), Math.Max(_ledger.NextSeq() - 1, 0));
+    public (List<(long Seq, MqMessage Msg)> Items, long UptoSeq) CaptureDlqSnapshot()
+        => (_dlqLedger.SnapshotWithSeq(), Math.Max(_dlqLedger.NextSeq() - 1, 0));
+
+    /// <summary>用集群快照整卷重建主账本：清 _ready/_locked/_dead → WAL 载入快照。</summary>
+    public void RestoreFromSnapshot(List<(long Seq, MqMessage Msg)> items, long uptoSeq)
+    {
+        _ledger.LoadSnapshot(items, uptoSeq);
+        while (_ready.TryDequeue(out _)) { }
+        _locked.Clear();
+        lock (_dlqLock) { _dead.Clear(); }
+        foreach (var (_, msg) in items.OrderBy(x => x.Seq)) _ready.Enqueue(msg);
+        _emit($"🧪 [{_queueName}] 快照恢复：ready={_ready.Count}");
+    }
+
+    /// <summary>死信账本快照重建（HashSet _dead 一次性还原）</summary>
+    public void DlqRestoreSnapshot(List<(long Seq, MqMessage Msg)> items, long uptoSeq)
+    {
+        _dlqLedger.LoadSnapshot(items, uptoSeq);
+        lock (_dlqLock)
+        {
+            _dead.Clear();
+            foreach (var (_, msg) in items.OrderBy(x => x.Seq)) _dead.Add(msg);
+        }
+        _emit($"🧪 [{_queueName}.dlq] 快照恢复：{_dead.Count} 条死信");
+    }
+
     /// <summary>DLX 投递目标：把外来死信收进本队列的死信账本（死信交换机绑定命中后调用）</summary>
     public List<LogMessage> AcceptDeadLetter(MqMessage msg)
     {

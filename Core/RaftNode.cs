@@ -1,20 +1,26 @@
 // ═══════════════════════════════════════════════════════════════
-// Core/RaftNode.cs —— Raft 状态机（Follower → Candidate → Leader 三态）
+// Core/RaftNode.cs —— Raft 状态机 v2（Follower → Candidate → Leader 三态）
+//                        + **动态成员表（join / leave）**
 //
-//   核心思想（教学简化版 Raft，仅实现 Leader 选举协议）：
+//   核心思想（教学简化版 Raft，仅实现 Leader 选举与成员变更协议）：
 //     1. Follower 超过 electionTimeout 没收到 Leader 心跳 → 变 Candidate
-//     2. Candidate 向所有其他节点请求投票（Term + 1）
-//     3. 收到多数派票（N/2+1）→ 当选 Leader
+//     2. Candidate 向所有其他成员请求投票（Term+1）
+//     3. 收到多数派票 → 当选 Leader
 //     4. 收到更高 Term 的 RPC → 自动降级为 Follower
+//     5. **成员变更（阶段 C)**：
+//        · 成员表持久化在 data/_cluster/members.json（每节点自己一份）
+//        · 变更（±1）必须走 Quorum：Leader 造一条 m 记录 → 广播 → 过半同意 → 各自 Apply
+//        · 投票/复制/心跳/写闸门全部动态读成员表（不再用死环境变量）
 //
-//   设计保证（安全性守则）：
-//     · 一个 Term 内最多投一票（防脑裂）
-//     · 心跳接收优先级高于投票（防频繁选举）
-//     · Election timeout 随机化（2000~4500ms）避免同时全员决定 Claiming
+//   同步闸门（Syncing）：
+//     · 新加入节点在「历史快照(catch-up)完成前」 → Syncing=true
+//     · 期间它 **不发起选举、不服务写请求、不参与写 Quorum 票数**
+//       （否则空账节点当选 = 无限脑裂候选）
 //
-//   集成方式：
-//     · HTTP RPC：Web\Endpoints.Raft.cs 提供的接口
-//     · Leader 就位自动挂 ClusterReplicator 推事件流
+//   下线（leave）：
+//     · 只有 Leader 能处理 leave（非 Leader 一律 503）
+//     · 离开节点若是 Leader 且想走 → commit 一条去掉自己的 m 事件（新表多数派 ack）
+//        → 立刻退回 Follower + 停心跳，让剩余成员重新选出新王
 // ═══════════════════════════════════════════════════════════════
 using System.Net.Http.Json;
 
@@ -25,38 +31,125 @@ public enum RaftRole { Follower, Candidate, Leader }
 public sealed class RaftNode : IDisposable
 {
     public sealed record RaftVoteResponse(long Term, string VoterId, bool VoteGranted);
+
     private readonly string _nodeId;
-    private readonly string[] _peerUrls;       // 除自身外的其他 Raft 节点 HTTP 基址
+    private readonly string _selfUrl;
     private readonly HttpClient _http = new();
     private readonly Random _rand = new();
-    private readonly Action<string>? _emit;   // 日志回调（看板流水使用）
+    private readonly Action<string>? _emit;
+    private readonly Persistence.MembershipStore _membership;
 
-    // ── Raft 核心状态（在 _stateLock 保护下手动修改） ──
-    private long _currentTerm;                // 当前任期号
-    private string? _votedFor;                // 当前任期投给了谁（null=未投）
-    private string? _leaderId_;               // Stage指定的leader id（内部state. Full name= Leader）
+    // ── Raft 核心状态（_raftLock 保护） ──
+    private long _currentTerm;
+    private string? _votedFor;
+        private string? _leaderId_;
     private RaftRole _role = RaftRole.Follower;
     private DateTime _lastHeartbeatUtc = DateTime.UtcNow;
     private int _electionTimeoutMs;
+    private readonly object _raftLock = new();   // Raft 状态统一锁（HTTP 线程 + 后台循环共用）
     private volatile bool _stopping;
     private Task? _raftLoopTask;
     private readonly CancellationTokenSource _cts = new();
 
+    // ── 同步 / 下线 闸门 ──
+    private bool _synced = true;        // 新节点 catch-up 完成前为 false（不投票、不竞选、不接写）
+    private bool _leaving = false;      // 本节点已宣布下线（Leave 已 Quorum）
+    private int _membershipChangeInProgress = 0;   // 一次只允许 ±1 调表
+
     public RaftRole Role => _role;
     public long CurrentTerm => _currentTerm;
     public string NodeId => _nodeId;
-    public string? CurrentLeaderId => _leaderId_ ?? _nodeId;
-    public IReadOnlyList<string> Peers => _peerUrls;
+    public string? CurrentLeaderId => _leaderId_;
+    /// <summary>本节点认为当前哪个节点是王（currentLeaderId 别名，write-ready 的可读字段）</summary>
+    public string? LeaderIdOfCluster() { lock (_raftLock) return _leaderId_ ?? _nodeId; }
+    public bool Synced => _synced;
 
-    public RaftNode(string nodeId, string selfUrl, string[] peerUrls, Action<string>? emit = null)
+    /// <summary>成员表（含自己在内）的快照</summary>
+    public IReadOnlyList<Persistence.RaftMember> Members { get { lock (_raftLock) return _membership.Table.ToList(); } }
+
+    /// <summary>供写流量就绪探针：Leader 且已同步 → 200</summary>
+    public bool WriteReady => _role == RaftRole.Leader && _synced && !_leaving;
+
+    /// <summary>复制目标（给 ClusterReplicator 的动态表）：除自身外的**已同步**成员 URL</summary>
+    public string[] PublishTargets()
+    {
+        lock (_raftLock)
+            return _membership.Table
+                .Where(m => m.Node != _nodeId && SyncFlag(m.Node))
+                .Select(m => m.Url).Distinct().ToArray();
+    }
+    /// <summary>写 Quorum 所需票数：已同步成员（含 Leader）的多数派</summary>
+    public int WriteMajority()
+    {
+        lock (_raftLock)
+        {
+            var n = _membership.Table.Count(m => m.Node == _nodeId || SyncFlag(m.Node));
+            return n / 2 + 1;
+        }
+    }
+    public int MemberCount { get { lock (_raftLock) return _membership.Table.Count; } }
+    /// <summary>成员表的 seq 迷行号（snapshot 载体）</summary>
+    public long MemberSeq() { lock (_raftLock) return _membership.Seq; }
+
+    /// <summary>成员是否已同步（Syncing 闸门；bootstrap 成员默认 true）</summary>
+    private bool SyncFlag(string node)
+        => _syncFlags.TryGetValue(node, out var v) ? v : true;
+
+    private static string ExtractHost(string url)
+    {
+        // "http://node-1:8080" → "node-1"；"http://mq-0.mq-headless.default.svc:8080" → "mq-0.mq-headless.default.svc"
+        var rest = url.Replace("http://", "").Replace("https://", "");
+        var host = rest.Split('/')[0];
+        var colon = host.IndexOf(':');
+        return colon >= 0 ? host[..colon] : host;
+    }
+
+    /// <summary>
+    /// 构造：数据目录里若有旧的 members.json → 回放还原（崩溃/重启无损）；
+    /// 否则用 bootstrapPeers 种表并落盘（写"第一任期成员表"）。
+    /// bootstrapPeers 是 URL 列表（含自身也无所谓，内部按 &lt;node,url&gt; 对齐）。
+    /// </summary>
+    public RaftNode(string nodeId, string selfUrl, string[] bootstrapPeerUrls, string dataDirectory, Action<string>? emit = null)
     {
         _nodeId = nodeId;
-        // 剥掉自身地址：自己不给自己发心跳/拉票 —— 否则 Leader 上任第 100ms 就把自己降级了
-        _peerUrls = peerUrls.Where(p => !string.Equals(p, selfUrl, StringComparison.OrdinalIgnoreCase)).ToArray();
+        _selfUrl = selfUrl;
         _emit = emit;
-        // 选举超时随机化 2000~4500 ms（同时发起选主概率低）
+
+        _membership = new Persistence.MembershipStore(dataDirectory, emit);
+
+        var table = new List<Persistence.RaftMember>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (_membership.Table.Count > 0)
+        {
+            // ── 磁盘回放（kv 恢复路径）──
+            table.AddRange(_membership.Table);
+            _emit?.Invoke($"📇 [raft:{_nodeId}] 成员表回放（{_membership.Table.Count} 人）");
+        }
+        else if (bootstrapPeerUrls.Length == 0)
+        {
+            // ── join 模式：bootstrapPeers 为空（新节点不带成员表启动）→ 不自封为王，等 join 通告
+            _synced = false;
+            _emit?.Invoke($"🧪 [raft:{_nodeId}] join 模式：空成员表启动，等待 join 通告后 catch-up");
+            _electionTimeoutMs = _rand.Next(2000, 4500);
+            return;
+        }
+        else
+        {
+            // ── 出厂引导 ──
+            foreach (var url in bootstrapPeerUrls.Where(u => !string.IsNullOrWhiteSpace(u)))
+            {
+                var host = ExtractHost(url);     // 以 URL 主机名当节点名（node-1/node-2… 或 k8s 的 mq-0）
+                if (!seen.Add(host)) continue;
+                table.Add(new Persistence.RaftMember(host, url));
+            }
+            // 自身必须入表（可能 bootstrap 里没写自己，也可能写法不一致）
+            if (!seen.Contains(_nodeId)) table.Add(new Persistence.RaftMember(_nodeId, _selfUrl));
+            _membership.Seed(table);
+            _emit?.Invoke($"📇 [raft:{_nodeId}] 首次上牌：成员表 {table.Count} 人 → {string.Join(',', table.Select(t => t.Node))}");
+        }
         _electionTimeoutMs = _rand.Next(2000, 4500);
-        _lastHeartbeatUtc = DateTime.UtcNow;
+        foreach (var m0 in _membership.Table) _syncFlags[m0.Node] = true;   // 出厂成员视为已同步
+        if (_membership.Table.Count == 0) _synced = false;   // 空成员表（新节点 join 模式）→ Syncing 闸门
     }
 
     // ── Start：Background loop（心跳 + 选举）─
@@ -75,35 +168,28 @@ public sealed class RaftNode : IDisposable
         return _raftLoopTask;
     }
 
-    public void Stop()
-    {
-        _stopping = true;
-        _cts.Cancel();
-    }
+    public void Stop() { _stopping = true; _cts.Cancel(); }
+    public void Dispose() { Stop(); _cts.Dispose(); _http.Dispose(); }
 
-    public void Dispose()
-    {
-        Stop();
-        _cts.Dispose();
-        _http.Dispose();
-    }
-
-    // 主循环 tick：每 100ms检测一次（Follower election timeout/Leader heartbeat broadcast）
     private async Task RunTickAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested && !_stopping)
         {
             await Task.Delay(100, ct);
-            var elapsedMs = (DateTime.UtcNow - _lastHeartbeatUtc).TotalMilliseconds;
+            bool synced; RaftRole role; double elapsedMs;
+            lock (_raftLock)
+            {
+                role = _role; synced = _synced && !_leaving;
+                elapsedMs = (DateTime.UtcNow - _lastHeartbeatUtc).TotalMilliseconds;
+            }
+            if (!synced) continue;                        // 追平前：不心跳不竞选
 
-            switch (_role)
+            switch (role)
             {
                 case RaftRole.Leader:
                     await SendHeartbeatsAsync(ct);
                     break;
-                case RaftRole.Follower:
-                case RaftRole.Candidate:
-                    // 如果距上次心跳超时，变候选议
+                default:   // Follower / Candidate
                     if (elapsedMs >= _electionTimeoutMs)
                         await StartElectionAsync(ct);
                     break;
@@ -111,18 +197,24 @@ public sealed class RaftNode : IDisposable
         }
     }
 
-    // ── Candidate：发选举（Term+1，自投 + 请其他节点投票）──
+    // ── Candidate：发选举（Term+1，自投 + 请其他成员投票）──
     private async Task StartElectionAsync(CancellationToken ct)
     {
-        _currentTerm++;
-        _votedFor = _nodeId;       // 给自己一票
-        _role = RaftRole.Candidate;
-        _leaderId_ = null;
+        string[] peers;
+        int votesNeeded;
+        lock (_raftLock)
+        {
+            if (_leaving) return;                                  // 已宣布离场的节点不再拉票
+            _currentTerm++;
+            _votedFor = _nodeId;
+            _role = RaftRole.Candidate;
+            _leaderId_ = null;
+            peers = _membership.Table.Where(m => m.Node != _nodeId).Select(m => m.Url).ToArray();
+            votesNeeded = _membership.Table.Count / 2 + 1;
+        }
+        _emit?.Invoke($"🔔 [raft:{_nodeId}] term={_currentTerm} Candidate → 向 {peers.Length} 节点请求投票");
 
-        _emit?.Invoke($"🔔 [raft:{_nodeId}] term={_currentTerm} Candidate → 向 {_peerUrls.Length} 节点请求投票");
-
-        // 并行给所有 peer 发送 RequestVote
-        var tasks = _peerUrls.Select(async peer =>
+        var tasks = peers.Select(async peer =>
         {
             try
             {
@@ -138,89 +230,300 @@ public sealed class RaftNode : IDisposable
         }).ToList();
 
         var votes = await Task.WhenAll(tasks);
-        int grantedCount = 1;                        // 自己 + 1 票
+        int grantedCount = 1;
         foreach (var v in votes) if (v) grantedCount++;
 
-        var majority = (_peerUrls.Length + 1) / 2 + 1;     // N/2+1 (leader本人+N x n众人)
-        if (grantedCount >= majority)
+        bool won;
+        lock (_raftLock) won = grantedCount >= votesNeeded;
+        if (won)
         {
-            _role = RaftRole.Leader;
-            _leaderId_ = _nodeId;
-            _emit?.Invoke($"👑 [raft:{_nodeId}] 当选 Leader (term={_currentTerm}, votes={grantedCount}/{_peerUrls.Length + 1})");
-            await SendHeartbeatsAsync(ct);   // 上任就立刻给所有人发心跳广播
+            lock (_raftLock)
+            {
+                _role = RaftRole.Leader;
+                _leaderId_ = _nodeId;
+            }
+            _emit?.Invoke($"👑 [raft:{_nodeId}] 当选 Leader (term={_currentTerm}, votes={grantedCount}/{peers.Length + 1})");
+            await SendHeartbeatsAsync(ct);
         }
         else
         {
-            _role = RaftRole.Follower;
-            _electionTimeoutMs = _rand.Next(2000, 4500);
-            _lastHeartbeatUtc = DateTime.UtcNow;
+            lock (_raftLock)
+            {
+                _role = RaftRole.Follower;
+                _electionTimeoutMs = _rand.Next(2000, 4500);
+                _lastHeartbeatUtc = DateTime.UtcNow;
+            }
         }
     }
 
-    // ── Leader 心跳广播（AppendEntries 空包：向所有 follower 通知自己存在）
-    //  ⚠️ 不给自己发心跳——否则 ReceiveHeartbeat 会把自己的 Leader 降级为 Follower !
     private async Task SendHeartbeatsAsync(CancellationToken ct)
     {
+        string[] peers;
+        lock (_raftLock) peers = _membership.Table.Where(m => m.Node != _nodeId).Select(m => m.Url).ToArray();
         var hb = new { term = _currentTerm, leaderId = _nodeId };
-        var tasks = _peerUrls.Select(async peer =>
+        var tasks = peers.Select(async peer =>
         {
-            try
-            {
-                await _http.PostAsJsonAsync($"{peer}/api/raft/heartbeat", hb);
-            }
+            try { await _http.PostAsJsonAsync($"{peer}/api/raft/heartbeat", hb); }
             catch { /* silently fail — follower might be offline */ }
         });
         await Task.WhenAll(tasks);
     }
-    // ── 处理 HTTP 的 /api/raft/vote（Candidate 请求，返回投票结果）──
-    private readonly object _raftLock = new();   // Raft 状态统一锁（HTTP 线程 + 后台循环共用）
 
+    // ── 处理 HTTP 的 /api/raft/vote ──
     public RaftVoteResponse HandleVote(string candidateId, long candidateTerm)
     {
         lock (_raftLock)
         {
-            // ① 更高任期 → 先收养（Raft 规则：Adopt new term 之前，本任期投票记录立即作废）
-            //    没有这条，各节点抱着 "_votedFor=自己" 死锁，永远选不出 Leader
+            if (_leaving || !_synced)
+            {
+                // 同步中 / 已离场节点：不参与投票（它是"账本空洞"，投出去没有保障）
+                _emit?.Invoke($"🧊 [raft:{_nodeId}] 拒票（syncing={_synced == false}, leaving={_leaving}）candidate={candidateId}");
+                return new RaftVoteResponse(_currentTerm, _nodeId, false);
+            }
+
             if (candidateTerm > _currentTerm)
             {
                 _currentTerm = candidateTerm;
                 _votedFor = null;
                 if (_role != RaftRole.Follower) _role = RaftRole.Follower;
             }
-
-            // ② 旧任期拒绝
             if (candidateTerm < _currentTerm)
                 return new RaftVoteResponse(_currentTerm, _nodeId, false);
-
-            // ③ 同一任期只投一票
             if (_votedFor is not null && _votedFor != candidateId)
                 return new RaftVoteResponse(_currentTerm, _nodeId, false);
 
-            // ④ 授权投票
             _votedFor = candidateId;
             _role = RaftRole.Follower;
-            _lastHeartbeatUtc = DateTime.UtcNow;  // 重置选举计时器
+            _lastHeartbeatUtc = DateTime.UtcNow;
             return new RaftVoteResponse(candidateTerm, _nodeId, true);
         }
     }
 
-    // ── 处理 HTTP /api/raft/heartbeat（Leader 心跳）──
+    // ── 处理 HTTP /api/raft/heartbeat ──
     public void ReceiveHeartbeat(string leaderId, long term)
     {
         lock (_raftLock)
         {
-            if (term < _currentTerm) return;    // 忽略旧 term 心跳
-
-            // 收到更高任期心跳 → 收养 term，清掉本任期投票记录
-            if (term > _currentTerm)
-            {
-                _currentTerm = term;
-                _votedFor = null;
-            }
-
+            if (_leaving) return;
+            if (term < _currentTerm) return;
+            if (term > _currentTerm) { _currentTerm = term; _votedFor = null; }
             if (_role != RaftRole.Follower) _role = RaftRole.Follower;
             _leaderId_ = leaderId;
             _lastHeartbeatUtc = DateTime.UtcNow;
         }
+    }
+
+    // ════════════ 动态成员变更（Join / Leave / Apply）════════════
+
+    /// <summary>join（Leader 专用）：把 newNode 提交为成员 + 走 Quorum（除 Leader 外的旧成员 ack）。非 Leader → 503。</summary>
+    public async Task<(bool Ok, string Error)> JoinMemberAsync(string newNode, string newUrl)
+    {
+        List<Persistence.RaftMember> oldTable, newTable;
+        lock (_raftLock)
+        {
+            if (_role != RaftRole.Leader) return (false, "仅 Leader 节点处理 join");
+            if (_leaving) return (false, "本节点已宣布离场");
+            if (System.Threading.Interlocked.Exchange(ref _membershipChangeInProgress, 1) == 1)
+                return (false, "已有成员变更进行中（±1）");
+
+            oldTable = _membership.Table.ToList();
+            if (oldTable.Count >= 9) return (false, "成员数已到上限（教学版 ≤9）");
+            if (_membership.Contains(newNode))
+            {
+                // 幂等语义：如果同名且 URL 一致（catch-up 卡住重放 join 的情况）→ 直接当作成功
+                string existingUrl = "";
+                _membership.TryGetUrl(newNode, out existingUrl);
+                if (string.Equals(existingUrl, newUrl, StringComparison.OrdinalIgnoreCase))
+                    return (true, "");
+                return (false, $"节点名 {newNode} 已被占用（URL 不同请求：{existingUrl}）");
+            }
+            if (_membership.Table.Any(m => string.Equals(m.Url, newUrl, StringComparison.OrdinalIgnoreCase)))
+                return (false, $"URL {newUrl} 已被其他节点使用");
+            if (string.IsNullOrWhiteSpace(newNode) || string.IsNullOrWhiteSpace(newUrl))
+                return (false, "node / url 不能为空");
+
+            newTable = oldTable.Append(new Persistence.RaftMember(newNode, newUrl)).ToList();
+        }
+
+        try
+        {
+            var seq = _membership.NextSeq();
+            var (ok, detail) = await CommitMembershipEventAsync(seq, oldTable, newTable,
+                excludeNode: null, extraPushTargets: new[] { newUrl });
+            if (!ok) return (false, detail);
+
+            // Leader 视角：新节点进入"Syncing"（等待它 catch-up 完来 sync-ack）
+            lock (_raftLock)
+            {
+                _syncFlags[newNode] = false;
+                _emit?.Invoke($"🧪 [raft:{_nodeId}] join 已提交：{newNode}（seq={seq}）→ 等待 catch-up 后 sync-ack");
+            }
+            return (true, "");
+        }
+        finally
+        {
+            System.Threading.Interlocked.Exchange(ref _membershipChangeInProgress, 0);
+        }
+    }
+
+    /// <summary>leave（Leader 专用）：把某节点从成员表移除并 Quorum 提交。被移除节点无需 ack。</summary>
+    public async Task<(bool Ok, string Error)> LeaveMemberAsync(string leavingNode)
+    {
+        List<Persistence.RaftMember> oldTable, newTable;
+        bool selfLeaving;
+        lock (_raftLock)
+        {
+            if (_role != RaftRole.Leader) return (false, "仅 Leader 节点处理 leave");
+            if (_leaving) return (false, "本节点已宣布离场");
+            if (System.Threading.Interlocked.Exchange(ref _membershipChangeInProgress, 1) == 1)
+                return (false, "已有成员变更进行中（±1）");
+            oldTable = _membership.Table.ToList();
+            if (!_membership.Contains(leavingNode))
+                return (false, $"节点 {leavingNode} 不在成员表里");
+            if (oldTable.Count <= 1)
+                return (false, "桌上只剩一个人，不能自己把自己开除");
+            newTable = oldTable.Where(m => m.Node != leavingNode).ToList();
+            selfLeaving = string.Equals(leavingNode, _nodeId, StringComparison.OrdinalIgnoreCase);
+        }
+
+        try
+        {
+            var seq = _membership.NextSeq();
+            var (ok, detail) = await CommitMembershipEventAsync(seq, oldTable, newTable,
+                excludeNode: leavingNode, extraPushTargets: Array.Empty<string>());
+            if (!ok) return (false, detail);
+
+            // 被移除的是自己（Leader 自我离场）？→ 退回 Follower、不再心跳，让剩余成员选新王
+            if (selfLeaving)
+            {
+                lock (_raftLock)
+                {
+                    _role = RaftRole.Follower;
+                    _leaderId_ = null;
+                    _leaving = true;
+                    _lastHeartbeatUtc = DateTime.UtcNow;   // 不触发竞选
+                }
+                _emit?.Invoke($"🚪 [raft:{_nodeId}] 优雅下线：自我移除已 Quorum 通过，让出 Leader 给剩余成员重新选举");
+            }
+            return (true, "");
+        }
+        finally
+        {
+            System.Threading.Interlocked.Exchange(ref _membershipChangeInProgress, 0);
+        }
+    }
+
+    /// <summary>Follower 收到 Leader 推来的 m 事件（Quorum 已在其侧通过）→ 本地 apply + 落盘</summary>
+    public void ApplyMembership(long seq, List<Persistence.RaftMember> table)
+    {
+        lock (_raftLock)
+        {
+            _membership.Apply(seq, table);
+            if (table.Any(m => m.Node == _nodeId)) _synced = _synced;   // 老成员：本来就同步
+            // 新节点（无 WAL 历史）的 synced 由 catch-up 完成 → MarkSynced 转 true
+        }
+    }
+
+    public void MarkSynced(bool value)
+    {
+        lock (_raftLock)
+        {
+            if (_synced != value)
+            {
+                _synced = value;
+                _lastHeartbeatUtc = DateTime.UtcNow;
+            }
+        }
+        _emit?.Invoke(value
+            ? $"🧪 [raft:{_nodeId}] catch-up 完成 → 正式成为集群成员（可投票/可竞选）"
+            : $"🧪 [raft:{_nodeId}] 进入 Syncing 状态（历史快照追赶中）");
+    }
+
+    /// <summary>本节点成员表是否为空（判"新节点 join 模式"的唯一证据）</summary>
+    public bool NeedsJoinAtBoot { get { lock (_raftLock) return _membership.Table.Count == 0; } }
+    /// <summary>
+    /// Join-on-boot 自助流程（新空节点）：
+    ///   ① 向已知 Leader 发 join（带自身 node/url）→ Leader 走 Quorum 提交成员表
+    ///   ② 从 Leader 拉 /api/raft/snapshot（活账快照）→ hub.ApplySnapshot 写回自己磁盘
+    ///   ③ 自身 MarkSynced(true) → 转正
+    /// 全程异步；失败自动退避重试（Leader 换人/网络抖动等）。调用方 fire-and-forget。
+    /// </summary>
+    public async Task StartJoinAndCatchUpAsync(string leaderUrl, MessageQueueHub hub)
+    {
+        var attempts = 0;
+        while (!_stopping && !_synced && NeedsJoinAtBoot && attempts < 200)
+        {
+            attempts++;
+            try
+            {
+                // ① join（Leader 侧会走 Quorum；node/url 的成员表同时广播到自己这份节点）
+                var resp = await _http.PostAsJsonAsync($"{leaderUrl}/api/raft/join",
+                    new { node = _nodeId, url = _selfUrl });
+                if (!resp.IsSuccessStatusCode)
+                {
+                    await Task.Delay(3000);
+                    continue;
+                }
+
+                // ② 拉 Leader 的快照（可能要等 Leader 自己收敛好）
+                var snapResp = await _http.GetAsync($"{leaderUrl}/api/raft/snapshot");
+                if (!snapResp.IsSuccessStatusCode) { await Task.Delay(3000); continue; }
+                var snapBody = await snapResp.Content.ReadAsStringAsync();
+                var snap = System.Text.Json.JsonSerializer.Deserialize<MessageQueueLab.Core.MessageQueueHub.ClusterSnapshotBody>(snapBody);
+                if (snap is null) { await Task.Delay(3000); continue; }
+
+                // ③ 应用快照到本节点各队列（hub 内部逐个 QueueCore restore）
+                hub.ApplySnapshot(snap);
+
+                // ④ 通知 Leader 追平完成
+                await _http.PostAsJsonAsync($"{leaderUrl}/api/raft/sync-ack", new { node = _nodeId, synced = true });
+
+                _emit?.Invoke($"🎉 [raft:{_nodeId}] join + catch-up 完成（成员表 seq={snap.MemberSeq}）—— 正式入列");
+                return;
+            }
+            catch (Exception ex)
+            {
+                _emit?.Invoke($"‼️ [raft:{_nodeId}] join-on-boot 异常（重试中）：{ex.Message}\n{ex.StackTrace}");
+                await Task.Delay(4000);
+            }
+        }
+        _emit?.Invoke($"🚧 [raft:{_nodeId}] join-on-boot 放弃（尝试 {attempts} 次仍未成功）——手动介入处理");
+    }
+
+    // ── m 事件提交引擎：Leader 用它把成员变更广播到其他成员 ──
+    private Dictionary<string, bool> _syncFlags = new();   // node → 是否 catch-up 完成（Leaders 视角）
+
+    private async Task<(bool Ok, string Detail)> CommitMembershipEventAsync(
+        long seq, List<Persistence.RaftMember> oldTable, List<Persistence.RaftMember> newTable,
+        string? excludeNode, string[]? extraPushTargets)
+    {
+        var targets = oldTable
+            .Where(m => m.Node != _nodeId && (excludeNode is null || m.Node != excludeNode))
+            .Select(m => m.Url);
+        if (extraPushTargets is not null) targets = targets.Concat(extraPushTargets);
+        targets = targets.Distinct().ToList();
+
+        _emit?.Invoke($"📜 [raft:{_nodeId}] 提交成员变更 seq={seq}（旧 {oldTable.Count} 人 → 新 {newTable.Count} 人）→ 广播到：{string.Join(',', targets)}");
+
+        var tasks = targets.Select(async url =>
+        {
+            try
+            {
+                var body = new { seq, table = newTable.Select(t => new { t.Node, t.Url }) };
+                using var resp = await _http.PostAsJsonAsync($"{url}/api/raft/apply-membership", body);
+                return resp.IsSuccessStatusCode;
+            }
+            catch { return false; }
+        }).ToList();
+
+        var acks = await Task.WhenAll(tasks);
+        var required = oldTable.Count / 2 + 1;               // m 事件的 Quorum = 旧成员表的多数派（含 Leader 自身 1 票）
+        var total = 1 + acks.Count(a => a);                  // Leader 自己算一票
+        var ok2 = total >= required;
+        if (ok2)
+        {
+            _membership.Apply(seq, newTable);
+        }
+        return (ok2, ok2 ? "" : $"Quorum 未达（{total}/{required}）：{string.Join(',', targets)}");
     }
 }

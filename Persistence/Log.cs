@@ -250,6 +250,40 @@ public sealed class Log
         return _state.Values.OrderBy(x => x.Seq).Select(x => x.Msg).ToList();
     }
 
+    /// <summary>带 Seq 的活账视图（catch-up 快照用）。</summary>
+    public List<(long Seq, MqMessage Msg)> SnapshotWithSeq()
+        => _state.Values.OrderBy(x => x.Seq).Select(x => (x.Seq, x.Msg)).ToList();
+    public long NextSeq() => _nextSeq;       // _nextSeq 是"下一个未用 Seq"，uptoSeq = NextSeq - 1
+
+    /// <summary>
+    /// catch-up 快照写入：清空本账本所有段文件，整段重建（只含活账 e 事件 + Seq 保真）。
+    /// 场景：新节点 join 后从 Leader 拿快照落盘回放。
+    /// </summary>
+    public void LoadSnapshot(List<(long Seq, MqMessage Msg)> items, long uptoSeq)
+    {
+        lock (_activeAppendLock)
+        {
+            // ① 清掉既有段文件（包括压缩产物）
+            foreach (var seg in _segments) seg.Delete();
+            if (_activeSegment is not null) { _activeSegment.Delete(); _activeSegment = null; }
+            _segments = new List<LogSegment>();
+            _state.Clear();
+            _activeLines = 0;
+            _nextSegmentIndex = 1;
+
+            // ② 重建一个含全量活账的段文件（用当前 Seq 数字保真）
+            OpenNewActiveSegment();
+            foreach (var (seq, msg) in items.OrderBy(x => x.Seq))
+            {
+                var evt = new LogMessage(seq, QueueName, "e", msg, msg.Id);
+                _activeSegment!.Append(evt);
+                _state[msg.Id] = (seq, msg);
+            }
+            _nextSeq = Math.Max(uptoSeq, 0) + 1;
+        }
+        _emit($"🧾 [{_dir}] 快照载入：{_state.Count} 条活账（uptoSeq={uptoSeq}）");
+    }
+
     // 触发条件（双重门槛）：已封段≥4 或（50% 脏率 +（行数≥128/段龄>1h））
     //   v2：写入路径不再各自触发，改由后台压缩巡检线程统一定时拉起（见 Program.StartSweeper）
     public void SweepCompaction()

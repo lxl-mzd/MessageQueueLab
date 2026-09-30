@@ -60,8 +60,19 @@ public class ClusterReplicator
     {
         var ackedBy = new List<string>();
 
+        // ── 动态成员表（Raft 成员驱动；无 Raft 引用时退回静态 env 配置的 _followers） ──
+        RaftNode? raft = null;
+        RaftNode? raftNode = ClusterOptions.Raft;
+        if (raftNode != null && raftNode.Synced) raft = raftNode;
+        var targets = raft is not null
+                        ? raft.PublishTargets()      // Syncing 成员被 Raft 状态闸门自动过筛
+                        : _followers;
+        var ackRequired = raft is not null ? raft.WriteMajority()
+                                                        : Math.Max(1, targets.Length / 2 + 1);
+        var totalMembers = raft is not null ? raft.MemberCount : targets.Length + 1;
+
         // 并行传感器：每个 follower 一张“回执票”（POST；返回成功=真回执）
-        var tasks = _followers.Select(async f =>
+        var tasks = targets.Select(async f =>
         {
             try
             {
@@ -77,7 +88,7 @@ public class ClusterReplicator
         var done = await Task.WhenAll(tasks);
         ackedBy.AddRange(done.Where(x => x != null).Cast<string>());
 
-        return new ReplicationResult(ackedBy.Count + 1, _followers.Length + 1, ackedBy);
+        return new ReplicationResult(ackedBy.Count + 1, totalMembers, ackedBy);
     }
 }
 

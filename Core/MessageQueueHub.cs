@@ -191,6 +191,48 @@ public class MessageQueueHub
 
     public List<ExchangeDef> ListExchanges() => _exchanges.Values.ToList();
 
+    // ═══════ 集群快照（catch-up 载体）═══════
+    //  新节点 join 之后、成为正式成员之前，从当前 Leader 拉取：
+    //    · 每队列的「活账 + 最高 Seq」（消息账本 + 死信账本）
+    //  Apply 后 RaftNode.MarkSynced(true) 才能转正。
+
+    public sealed record SnapshotItem(long Seq, MqMessage Msg);
+    public sealed record QueueLedgerSnapshot(string Queue, long UptoSeq, List<SnapshotItem> Events);
+    public sealed record ClusterSnapshotBody(long MemberSeq, List<QueueLedgerSnapshot> Queues);
+
+    public ClusterSnapshotBody CaptureSnapshot()
+    {
+        var qsnaps = new List<QueueLedgerSnapshot>();
+        foreach (var q in _queues.Values)
+        {
+            var (liveList, liveSeq) = q.CaptureLedgerSnapshot();      // 主账
+            var (deadList, deadSeq)  = q.CaptureDlqSnapshot();        // 死信账本
+            qsnaps.Add(new QueueLedgerSnapshot(q.QueueName, liveSeq, liveList.Select(x => new SnapshotItem(x.Seq, x.Msg)).ToList()));
+            qsnaps.Add(new QueueLedgerSnapshot(q.QueueName + ".dlq", deadSeq, deadList.Select(x => new SnapshotItem(x.Seq, x.Msg)).ToList()));
+        }
+        var memberSeq = ClusterOptions.Raft?.MemberSeq() ?? 0;
+        return new ClusterSnapshotBody(memberSeq, qsnaps);
+    }
+
+    public void ApplySnapshot(ClusterSnapshotBody snap)
+    {
+        foreach (var qs in snap.Queues)
+        {
+            if (qs.Queue.EndsWith(".dlq", StringComparison.OrdinalIgnoreCase))
+            {
+                var rootQueue = qs.Queue[..^4];
+                var q = Get(rootQueue) ?? DeclareQueue(rootQueue);
+                q.DlqRestoreSnapshot(qs.Events.Select(x => (x.Seq, x.Msg)).ToList(), qs.UptoSeq);
+            }
+            else
+            {
+                var q = Get(qs.Queue) ?? DeclareQueue(qs.Queue);
+                q.RestoreFromSnapshot(qs.Events.Select(x => (x.Seq, x.Msg)).ToList(), qs.UptoSeq);
+            }
+        }
+        PushEvent($"🧪 [snapshot] 应用集群快照：{snap.Queues.Count} 个账本已追赶");
+    }
+
     // ── 死信交换机执行器（QueueCore.SetDeadSink 挂进来的回调）──
     //   routingKey = "dead.{来源队列}"，topic 通配匹配 → 命中的绑定队列收 DLQ 投递
     //   没有任何绑定命中 → 回退：回自家队列的死信账本（不弄丢尸体）
