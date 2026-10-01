@@ -2,16 +2,15 @@
 # 自造消息队列 · 三节点 Raft 集群
 #   node-1 / node-2 / node-3（节点名和容器 DNS 一致， raft 成员表自动生成）
 #   MQ_PEERS = Raft 全员表（每节点都要写全 3 员，含自身）
-#   MQ_ROLE = leader/follower（动态主权下只影响初始写入口；Raft 王位接管后以王为准）
+#   身份（王/民）一律由 Raft 选举决定，没有静态角色参数
 # ==========================================================
 x-mq-peers: &mq-peers "http://node-1:8080,http://node-2:8080,http://node-3:8080"
 
 services:
   node-1:
-    image: mq-lab:18
+    image: mq-lab:22
     build: .
     environment:
-      MQ_ROLE: leader
       MQ_NODE_NAME: node-1
       MQ_SELF: "http://node-1:8080"
       MQ_PEERS: *mq-peers
@@ -22,9 +21,8 @@ services:
       - mqlab-leader:/app/data
 
   node-2:
-    image: mq-lab:18
+    image: mq-lab:22
     environment:
-      MQ_ROLE: follower
       MQ_NODE_NAME: node-2
       MQ_SELF: "http://node-2:8080"
       MQ_PEERS: *mq-peers
@@ -35,9 +33,8 @@ services:
       - mqlab-follower-1:/app/data
 
   node-3:
-    image: mq-lab:18
+    image: mq-lab:22
     environment:
-      MQ_ROLE: follower
       MQ_NODE_NAME: node-3
       MQ_SELF: "http://node-3:8080"
       MQ_PEERS: *mq-peers

@@ -38,7 +38,7 @@ public class ClusterReplicator
 {
     /// <summary>与 follower 通信的 HttpClient（BaseAddress 在每个 follower 的请求前拼接）</summary>
     private readonly HttpClient _http = new();
-    /// <summary>follower 基址数组（来自 env MQ_FOLLOWERS）</summary>
+    /// <summary>启动期 follower 基址（Program 喂的 BootstrapTargets；运行时走 Raft 成员表，此仅 fallback）</summary>
     private readonly string[] _followers;
     /// <summary>达到多数派需要的 follower 回执票数（阈值：N/2+1）</summary>
     private readonly int _requiredAcks;          // 需要几个 follower 回执（含 leader 已=1）

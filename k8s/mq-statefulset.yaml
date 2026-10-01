@@ -37,7 +37,7 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
         - name: mq
-          image: mq-lab:21
+          image: mq-lab:22
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -62,9 +62,6 @@ spec:
             # ⑤ MQ_LEADER_URL：扩容节点 (mq-3+) 的自动 join 目标 —— 用 mq-write Service（自动指王）
             - name: MQ_LEADER_URL
               value: "http://mq-write.default.svc.cluster.local:8080"
-            # ⑤ MQ_ROLE（只需要是 leader/follower 才能进入 Distributed 模式；动态主权由 Raft 决定）
-            - name: MQ_ROLE
-              value: "leader"
             # ⑥ 业务写入口检查 check（Leader 的 readiness 探针）
           readinessProbe:
             httpGet:

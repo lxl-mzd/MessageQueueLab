@@ -39,13 +39,15 @@ public static class ClusterEndpoints
         app.MapGet("/api/cluster/status", () =>
         {
             var (ready, locked, pending, dead) = hub.Aggregate();
+            var raft = ClusterOptions.Raft;
             return Results.Ok(new
             {
-                role = ClusterOptions.Role,
+                // 身份看 Raft 现状（单机无 Raft 即 single），不再读任何静态 ROLE
+                role = raft is null ? "single" : raft.Role.ToString(),
                 node = ClusterOptions.NodeName,
-                peers = ClusterOptions.Distributed
-                    ? (ClusterOptions.IsLeader ? ClusterOptions.Followers : new[] { ClusterOptions.LeaderUrl })
-                    : Array.Empty<string>(),
+                peers = raft is not null
+                    ? raft.Members.Where(m => m.Node != ClusterOptions.NodeName).Select(m => m.Url).ToArray()
+                    : ClusterOptions.Peers.Where(u => u.Length > 0 && u != ClusterOptions.SelfUrl).ToArray(),
                 queues = new { ready, locked, pendingOnDisk = pending, deadLetters = dead },
             });
         });

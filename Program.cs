@@ -4,7 +4,7 @@
 //  5 步：
 //    ① CreateBuilder       ASP.NET web框架
 //    ② CORS 全开放         为了看板/测试
-//    ③ 集群身份装配        Leader 持复制器；Follower 不挂
+//  ③ 集群身份装配        分布式下每个节点都持复制器；单机不挂
 //    ④ Raft 节点 born 并启动心跳/选举 loop
 //    ⑤ 注册 6 组路由
 //
@@ -16,9 +16,11 @@
 //      → leader(5081)/follower1(5082)/follower2(5083)，Raft 自动选举
 //
 //  Raft 环境变量（docker-compose 注入）：
-//    MQ_NODE_ID    "node-leader" / "node-f1" / "node-f2"
-//    MQ_PEERS      "http://mq-leader:8080,http://mq-follower-1:8080,http://mq-follower-2:8080"
-//    MQ_ROLE       leader / follower （决定初始 Role，后续由 Raft 自动晋升/降级）
+//    MQ_NODE_ID    "node-1" / "node-2" / "node-3"（compose）或 Pod 名（K8s）
+//    MQ_PEERS      全员表逗号分隔（含自身，种子节点用；join 节点可为空）
+//    MQ_SELF       本节点对外 URL（成员表身份证）
+//    MQ_LEADER_URL join 目标（新节点找王；单机为空）
+//    身份（王/民）一律由 Raft 选举决定，没有静态角色参数
 //
 // ═══════════════════════════════════════════════════════════════
 using MessageQueueLab.Core;
@@ -32,11 +34,10 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
     p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 
-// ── 集群身份装配（v2 动态主权）：分布式下每个节点都持复制器 ——
-//    王位切到谁，谁就朝另外两间发货（ReplicationTargets = MQ_PEERS 剥自己）
+// ── 集群身份装配：分布式下每个节点都持复制器（运行时目标走 Raft 成员表） ──
 //    单机模式不建复制器
 ClusterReplicator? replicator =
-    ClusterOptions.Distributed ? new ClusterReplicator(ClusterOptions.ReplicationTargets) : null;
+    ClusterOptions.Distributed ? new ClusterReplicator(ClusterOptions.BootstrapTargets) : null;
 
 builder.Services.AddSingleton(new MessageQueueHub("data", replicator));
 
@@ -94,7 +95,7 @@ app.MapClusterApi(hub);                     // 集群复制接收 + 集群状态
 app.MapRaftApi(raftNode, hub);              // Raft vote/heartbeat/status
 app.StartSweeper(hub);                      // 巡查员后台线程（含TTL、ratio GC）
 
-hub.PushEvent($"🚾 集群节点就绪（role={ClusterOptions.Role} node={ClusterOptions.NodeName}）");
+hub.PushEvent($"🚾 集群节点就绪（role={raftNode?.Role.ToString() ?? "single"} node={ClusterOptions.NodeName}）");
 hub.PushEvent("⏳ Raft 开始心跳/选举");
 
 // ── 步骤 ⑥：优雅下线（SIGTERM → .NET ApplicationStopping → leave → 退出）──

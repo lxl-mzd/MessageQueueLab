@@ -102,7 +102,7 @@ data/{queue}.dlq/                  （死信账本，同款 WAL 机制）
    ▼                                                                ▼
  RaftNode(term 收养 / 同任期一票 / 随机 2~4.5s 超时)  →  王位在谁
       │
-      ├── 写入闸门：IsWriter = Raft.Role == Leader   （MQ_ROLE 只是初始声明）
+      ├── 写入闸门：IsWriter = Raft.Role == Leader   （身份一律由选举决定，无静态角色参数）
       ├── 复制目的地：ReplicationTargets = MQ_PEERS - MQ_SELF  （王在谁，就朝另两间发货）
       └── 复制流接收：非现任王都收 /api/cluster/replicate
 

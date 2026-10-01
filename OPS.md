@@ -313,8 +313,10 @@ kubectl top pods
 ```bash
 docker run -d --name node-4 --network messagequeuelab_default -p 5084:8080 \
   -e MQ_NODE_NAME=node-4 -e MQ_SELF=http://node-4:8080 -e MQ_PEERS= \
-  -e MQ_ROLE=leader -e MQ_LEADER_URL=http://node-1:8080 mq-lab:21
+  -e MQ_LEADER_URL=http://node-1:8080 mq-lab:22
 ```
+
+> 不用写 ROLE：空 `MQ_PEERS` 就是 join 模式，身份由选举定；写 `leader` 也不会加冕。
 
 **第 2 步：等 1 分钟，看它自己入列。** 新节点会自动：报到 → 拿成员表 → 从王那里把历史数据补齐 → 开始干活。你要做的只是等，然后验证：
 
@@ -398,8 +400,10 @@ K8s 的卷名用 `kubectl get pvc` 查，`v` 后面换成对的卷名，命令�
 mkdir -p $PWD/data
 tar xzf mqlab-2026-09-24.tar.gz -C $PWD/data
 docker run -d -p 5000:8080 -v $PWD/data:/app/data \
-  -e MQ_ROLE=single ghcr.io/lxl-mzd/messagequeue-lab:latest
+  ghcr.io/lxl-mzd/messagequeue-lab:latest
 ```
+
+> 单机不用配任何环境变量：既无全员表又无 join 目标，默认就是单机。
 
 起来后看日志有"磁盘认领"字样就是认回来了。
 
