@@ -6,20 +6,24 @@ using MessageQueueLab.Models;
 
 namespace MessageQueueLab.Sdk;
 
-public sealed class SefMqAdmin
+public sealed class SefMqAdmin : IDisposable
 {
-    private readonly HttpClient _http;
+    private readonly SefMqClusterClient _cluster;
     private readonly string _queue;
 
     public SefMqAdmin(SefMqConfig config, string queue = "normal")
     {
-        _http = new HttpClient { BaseAddress = new Uri(config.Get("bootstrap.url")) };
+        _cluster = new SefMqClusterClient(config);
         _queue = queue;
     }
 
+    public void Dispose() => _cluster.Dispose();
+
     public async Task<(int Ready, int Locked, int PendingOnDisk, int DeadLetters)> QueueStatsAsync()
     {
-        var doc = JsonDocument.Parse(await _http.GetStringAsync("/api/queues"));
+        var resp = await _cluster.GetAsync("/api/queues");
+        resp.EnsureSuccessStatusCode();
+        var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
         foreach (var e in doc.RootElement.EnumerateArray())
         {
             if (e.GetProperty("queue").GetString() == _queue)
@@ -33,13 +37,15 @@ public sealed class SefMqAdmin
 
     public async Task<List<MqMessage>> DlqListAsync()
     {
-        var doc = JsonDocument.Parse(await _http.GetStringAsync($"/api/q/{_queue}/dlq"));
+        var resp = await _cluster.GetAsync($"/api/q/{_queue}/dlq");
+        resp.EnsureSuccessStatusCode();
+        var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
         var list = new List<MqMessage>();
         foreach (var e in doc.RootElement.EnumerateArray())
             list.Add(JsonSerializer.Deserialize<MqMessage>(e.GetRawText(), SefMqJson.CamelOpts)!);
         return list;
     }
 
-    public Task DlqAckAsync(string id)    => _http.PostAsync($"/api/q/{_queue}/dlq/{id}/ack", null);
-    public Task DlqReviveAsync(string id) => _http.PostAsync($"/api/q/{_queue}/dlq/{id}/revive", null);
+    public Task<HttpResponseMessage> DlqAckAsync(string id)    => _cluster.PostAsync($"/api/q/{_queue}/dlq/{id}/ack", null);
+    public Task<HttpResponseMessage> DlqReviveAsync(string id) => _cluster.PostAsync($"/api/q/{_queue}/dlq/{id}/revive", null);
 }

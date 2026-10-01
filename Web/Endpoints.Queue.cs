@@ -55,6 +55,8 @@ public static class QueueEndpoints
 
         app.MapPost("/api/q/{queue}/receive", (string queue, int? visibilitySeconds, int? waitMs) =>
         {
+            // follower 是纯副本：领取会产生本地锁（不复制），ack 回王上必然 404 —— 直接拒收
+            if (!ClusterOptions.IsWriter) return Results.StatusCode(503);
             var q = hub.Get(queue);
             if (q is null) return Results.NotFound(new { error = "不存在队列", queue });
             var msg = q.Receive(visibilitySeconds ?? 30, waitMs ?? 0);

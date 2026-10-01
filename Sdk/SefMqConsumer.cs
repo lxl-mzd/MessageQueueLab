@@ -10,17 +10,19 @@ using MessageQueueLab.Models;
 
 namespace MessageQueueLab.Sdk;
 
-public sealed class SefMqConsumer
+public sealed class SefMqConsumer : IDisposable
 {
-    private readonly HttpClient _http;
+    private readonly SefMqClusterClient _cluster;
     private readonly SefMqConfig _config;
     private string? _topic;
 
     public SefMqConsumer(SefMqConfig config)
     {
         _config = config;
-        _http = new HttpClient { BaseAddress = new Uri(config.Get("bootstrap.url")) };
+        _cluster = new SefMqClusterClient(config);
     }
+
+    public void Dispose() => _cluster.Dispose();
 
     public void Subscribe(string topic) => _topic = topic;
 
@@ -42,7 +44,7 @@ public sealed class SefMqConsumer
             {
                 try
                 {
-                    var resp = await _http.PostAsync($"/api/q/{_topic}/receive?visibilitySeconds={vis}&waitMs={waitMs}", null, cancel);
+                    var resp = await _cluster.PostAsync($"/api/q/{_topic}/receive?visibilitySeconds={vis}&waitMs={waitMs}", null, cancel);
                     if (resp.StatusCode == System.Net.HttpStatusCode.NoContent)
                     {
                         await Task.Delay(pollMs, cancel);
@@ -53,8 +55,8 @@ public sealed class SefMqConsumer
                     var msg = JsonSerializer.Deserialize<MqMessage>(json, SefMqJson.CamelOpts)!;
 
                     var ctx = new SefMqContext(
-                        ack:  async id => await _http.PostAsync($"/api/q/{_topic}/ack/{id}", null, cancel),
-                        nack: async id => await _http.PostAsync($"/api/q/{_topic}/nack/{id}", null, cancel));
+                        ack:  async id => await _cluster.PostAsync($"/api/q/{_topic}/ack/{id}", null, cancel),
+                        nack: async id => await _cluster.PostAsync($"/api/q/{_topic}/nack/{id}", null, cancel));
 
                     try
                     {

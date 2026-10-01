@@ -7,16 +7,16 @@ using MessageQueueLab.Models;
 
 namespace MessageQueueLab.Sdk;
 
-public sealed class SefMqProducer
+public sealed class SefMqProducer : IDisposable
 {
-    private readonly HttpClient _http;
+    private readonly SefMqClusterClient _cluster;
 
     public SefMqProducer(SefMqConfig config)
     {
-        var url = config.Get("bootstrap.url");
-        if (string.IsNullOrWhiteSpace(url)) throw new ArgumentException("缺少配置 bootstrap.url");
-        _http = new HttpClient { BaseAddress = new Uri(url) };
+        _cluster = new SefMqClusterClient(config);
     }
+
+    public void Dispose() => _cluster.Dispose();
 
     /// <summary>Kafka 同款 send(record, callback)：异步发送 + 回调（fire-and-forget）</summary>
     public void Send(SefMqRecord record, Action<SefMqMetadata?, Exception?>? callback = null)
@@ -33,8 +33,8 @@ public sealed class SefMqProducer
 
     private async Task<SefMqMetadata> SendInternalAsync(SefMqRecord record)
     {
-        var resp = await _http.PostAsJsonAsync($"/api/q/{record.Topic}/messages",
-                                               new { content = record.Value, key = record.Key });
+        var resp = await _cluster.PostAsync($"/api/q/{record.Topic}/messages",
+            JsonContent.Create(new { content = record.Value, key = record.Key }));
         resp.EnsureSuccessStatusCode();
         var doc = JsonSerializer.Deserialize<JsonElement>(await resp.Content.ReadAsStringAsync());
         // 集群版响应形状：{ message: MqMessage, replication: {...} }
