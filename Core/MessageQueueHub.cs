@@ -249,29 +249,39 @@ public class MessageQueueHub
         if (repl is null) return 0;
 
         var replayed = 0;
+        // 主账本 + 死信账本都要回放（水位 key = Ledger 名，与 seed/watermark 侧对齐）
+        var ledgers = new List<(string Key, Func<long, List<Persistence.LogMessage>> Read)>();
         foreach (var q in _queues.Values.ToList())
         {
-            var wm = repl.WatermarkOf(followerUrl, q.QueueName);
+            ledgers.Add((q.QueueName, q.ReadEventsFromSeq));
+            var dlqKey = q.QueueName + ".dlq";
+            ledgers.Add((dlqKey, q.ReadDlqEventsFromSeq));
+        }
+        foreach (var (key, read) in ledgers)
+        {
+            var wm = repl.WatermarkOf(followerUrl, key);
             if (wm is null || wm.Value < 0) continue;   // 无水位记录 → catch-up 快照负责，不做历史回放
-            var events = q.ReadEventsFromSeq(wm.Value + 1);
+            var events = read(wm.Value + 1);
             foreach (var evt in events)
             {
                 try
                 {
-                    dynamic resp = await DynamicPush(followerUrl, q.QueueName, evt);
-                    if (!resp) break;                     // 推送异常：中断本队列，等待下轮巡查
-                    repl.SeedWatermark(followerUrl, q.QueueName, evt.Seq);
+                    // 推给 follower 的"归属队列"用事件自带的 Ledger（PushExternal 按 Ledger 路由）
+                    var routeQ = evt.Ledger?.Length > 0 ? evt.Ledger : key;
+                    dynamic resp = await DynamicPush(followerUrl, routeQ, evt);
+                    if (!resp) break;                     // 推送异常：中断本账本，等待下轮巡查
+                    repl.SeedWatermark(followerUrl, key, evt.Seq);
                     replayed++;
                 }
                 catch { break; }
             }
         }
-        // 全队列都追上 → 解除 lagging（重新进入 ISR）
-        var stillBehind = _queues.Values.Any(q =>
+        // 全账本都追上 → 解除 lagging（重新进入 ISR）
+        var stillBehind = ledgers.Any(t =>
         {
-            var wm = repl.WatermarkOf(followerUrl, q.QueueName);
+            var wm = repl.WatermarkOf(followerUrl, t.Key);
             if (wm is null) return false;
-            return q.uptoSeqExistsAfter(wm.Value);
+            return t.Read(wm.Value).Count > 0;
         });
         if (!stillBehind) repl.MarkLagging(followerUrl, false);
         if (replayed > 0) PushEvent($"🔁 [delta-replay] {ShortUrl(followerUrl)} 补发 {replayed} 条事件");

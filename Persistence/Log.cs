@@ -306,7 +306,9 @@ public sealed class Log
                 _activeSegment!.Append(evt);
                 _state[msg.Id] = (seq, msg);
             }
-            _nextSeq = Math.Max(uptoSeq, 0) + 1;
+            // ③ _nextSeq 与新建/回放语义对齐：空账本从 0 起（首个事件 Seq=0 必须能进来），
+            //    否则 follower 的 PushExternal 幂等 guard（evt.Seq < _nextSeq）会把 Seq 0 静默丢掉还回 200。
+            _nextSeq = items.Count == 0 ? 0 : uptoSeq + 1;
         }
         _emit($"🧾 [{_dir}] 快照载入：{_state.Count} 条活账（uptoSeq={uptoSeq}）");
     }

@@ -138,6 +138,8 @@ public static class RaftEndpoints
                             hub.Replicator?.SeedWatermark(targetUrl, q.Name, seq);
                     }
                     // ③ 从水位处把"快照点 → 当前 Leader 水位"的漏事件补发（异步不阻塞 ack 返回）
+                    //    先标 lagging：回放中途失败则巡查员下轮重试，直到追平才解除
+                    hub.Replicator?.MarkLagging(targetUrl, true);
                     _ = hub.ReplayDeltaToFollowerAsync(targetUrl);
                 }
             }

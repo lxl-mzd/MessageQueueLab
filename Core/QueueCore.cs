@@ -275,9 +275,17 @@ public class QueueCore
     public List<LogMessage> ReadEventsFromSeq(long fromSeq)
         => _ledger.ReadEventsFromSeq(fromSeq);
 
+    /// <summary>死信账本的 delta 回溯读（key 固定为 "{queue}.dlq"，与 sync-ack 水位 key 对齐）。</summary>
+    public List<LogMessage> ReadDlqEventsFromSeq(long fromSeq)
+        => _dlqLedger.ReadEventsFromSeq(fromSeq);
+
     /// <summary>该队列的 WAL 里是否还有 Seq ≥ fromSeq 的事件（用于 follower 是否已追平的判定）。</summary>
     public bool uptoSeqExistsAfter(long fromSeq)
         => _ledger.ReadEventsFromSeq(fromSeq).Count > 0;
+
+    /// <summary>死信账本里是否还有 Seq ≥ fromSeq 的事件。</summary>
+    public bool dlqUptoSeqExistsAfter(long fromSeq)
+        => _dlqLedger.ReadEventsFromSeq(fromSeq).Count > 0;
 
     // ═══ catch-up 快照（新节点 join 场景，由 Leader 侧的 ApplySnapshot 调用） ═══
 

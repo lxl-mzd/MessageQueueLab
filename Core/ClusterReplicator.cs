@@ -90,13 +90,16 @@ public class ClusterReplicator
 
         var done = await Task.WhenAll(tasks);
         // ── per-follower 水位推进 + ISR 剔除标记（Leader 视角） ──
+        //    水位 key 必须用 Ledger（"normal"/"normal.dlq"），不能用 API queue 名：
+        //    主账本与死信账本是两个独立 Seq 空间，混用一个 key 会互相污染水位。
+        var ledgerKey = evt.Ledger?.Length > 0 ? evt.Ledger : queue;
         for (var i = 0; i < targets.Length; i++)
         {
             var f = targets[i];
             if (done[i] is not null)
             {
                 var wm = _watermarks.GetOrAdd(f, _ => new ConcurrentDictionary<string, long>());
-                wm.AddOrUpdate(queue, evt.Seq, (_, old) => Math.Max(old, evt.Seq));
+                wm.AddOrUpdate(ledgerKey, evt.Seq, (_, old) => Math.Max(old, evt.Seq));
                 _lagging.TryRemove(f, out _);
             }
             else
