@@ -268,9 +268,9 @@ compose / 单机不需要搭桥：单机直接 `http://localhost:5000/`，compos
 docker stats
 ```
 
-出来一张实时表，只看两列：
-- `CPU %`：长期 >80% → 机器扛不住了 → 去第 3 部分扩容
-- `MEM %`：长期 >80% → 同上
+出来一张实时表，只看两列（**只看病，不看扩容**——follower 不接客户端流量，加节点分担不了任何压力）：
+- `CPU %`：长期 >80% → 别扩容。去看板点开该节点卡：王的话查选举风暴（事件流搜 `当选 Leader` 频繁出现就是），跟随者的话查复制堆积。
+- `MEM %`：长期 >80% → 同样别扩容。内存涨只说明泄漏或快照堆积，重启该节点即可（数据在盘里，回放恢复）。
 
 **K8s：**
 
@@ -279,7 +279,7 @@ kubectl top pods
 ```
 
 没有这条命令？先装 metrics-server（Docker Desktop 一般自带，空就跳过，用 `docker stats` 看宿主机也行）：
-- 某个 mq Pod 的 CPU 一直顶满 → 去第 3 部分扩容
+- 某个 mq Pod 的 CPU 一直顶满 → 点开看板上它的资源明细查因（选举风暴/复制堆积），别扩容（follower 不分压）
 
 **先分清再动手**：如果 CPU/内存不高，但是"全集群就绪"一直涨——那不是机器小，是**消费者太慢**，加消费者，不加消息队列节点。
 
@@ -287,15 +287,22 @@ kubectl top pods
 
 ## 第三部分：扩缩容（什么时候扩 + 怎么扩 + 怎么缩）
 
-### 3.0 什么时候需要扩
+### 3.0 什么时候需要扩（只看成员健康，不看资源水位）
 
-三个信号，**中一个就考虑扩**：
+先记住定位：我们是微服务之间的通信中间件，吞吐量要求不高；follower 不接客户端流量，加节点分担不了压力。扩缩容唯一目的：**保住 quorum**（3 节点死 2 个就写瘫）。
 
-1. `docker stats` / `kubectl top pods` 里 CPU 或内存长期 >80%
-2. 看板"全集群就绪"只涨不掉，加消费者也追不上（写远大于读）
-3. `pendingOnDisk` 三节点差距 >100 且长时间不追平（复制跟不上了）
+两个信号，**中一个就补节点**：
 
-都不中？别扩，扩了浪费。
+1. 看板存活数 < 3（有节点失联 / `synced=false` 超过 10 分钟没自己回来）
+2. `memberCount` 长期 < 3（优雅下线后没补回来）
+
+都不中？别扩，扩了浪费。CPU/内存/磁盘高 → 那是"查因"不是"加人"：
+
+- CPU 飙 → 查选举风暴（事件流搜 `当选 Leader`）或消费堆积
+- 内存涨 → 泄漏或快照堆积，重启该节点（盘里数据不丢）
+- 磁盘涨 → 所有节点全量存数据，加节点反而更糟（新节点要全量复制）；看压缩事件，不行就扩磁盘卷
+
+**严禁**：给 StatefulSet 配 CPU/内存 HPA 自动扩缩。自动加减 Pod = 成员表来回 churn，每次都是一次 leave+join+选举。F1/F2 能自愈，但别主动找事。
 
 ### 3.1 compose 加节点（手动两步）
 
@@ -306,7 +313,7 @@ kubectl top pods
 ```bash
 docker run -d --name node-4 --network messagequeuelab_default -p 5084:8080 \
   -e MQ_NODE_NAME=node-4 -e MQ_SELF=http://node-4:8080 -e MQ_PEERS= \
-  -e MQ_ROLE=leader -e MQ_LEADER_URL=http://node-1:8080 mq-lab:18
+  -e MQ_ROLE=leader -e MQ_LEADER_URL=http://node-1:8080 mq-lab:21
 ```
 
 **第 2 步：等 1 分钟，看它自己入列。** 新节点会自动：报到 → 拿成员表 → 从王那里把历史数据补齐 → 开始干活。你要做的只是等，然后验证：
@@ -426,7 +433,7 @@ docker pull ghcr.io/lxl-mzd/messagequeue-lab:<旧的sha>
 | 出现 2 个 Leader | 脑裂：旧数据卷复活（僵尸成员表） | 删掉问题 Pod 的卷重建（K8s 已配自动回收，compose 手动 `volume rm`） |
 | `pendingOnDisk` 差 >100 | follower 掉线，delta replay 没跟上 | 查该节点连通性；巡查员每秒自动补，看事件流有没有 `delta-replay` |
 | 死信一直涨 | 下游业务挂了 | 先看死信内容，再修下游；急着恢复先点复活 |
-| 磁盘 >80% | WAL 涨太快，压缩跟不上 | 看事件流有没有 `压缩完成`；没有就加磁盘，消息太多就扩节点 |
+| 磁盘 >80% | WAL 涨太快，压缩跟不上 | 看事件流有没有 `压缩完成`；加节点没用（新节点要全量复制，更糟），扩磁盘卷或清过期数据 |
 | K8s Pod 一直 0/1 | 它是 follower（只有王 Ready，**正常的**） | 看 `role` 是不是 Follower，是就不用管 |
 | K8s Pod 一直 Pending | 磁盘 storageclass 问题 | 重启 Docker Desktop 再试 |
 
