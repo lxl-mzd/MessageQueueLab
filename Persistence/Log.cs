@@ -256,6 +256,33 @@ public sealed class Log
     public long NextSeq() => _nextSeq;       // _nextSeq 是"下一个未用 Seq"，uptoSeq = NextSeq - 1
 
     /// <summary>
+    /// delta 回溯读：从 WAL（含压缩段）里读出 Seq ≥ fromSeq 的全部事件行（e/n/d 原序）。
+    /// 场景：follower 掉队（ISR 剔除）后，Leader 从该 follower 的 watermark+1 处补发；
+    ///       压缩段保留的"活账终态行"也能给到（保证 catch-up 后窗口回溯读不缺行）。
+    /// 注意：若 fromSeq 早于最老存在的段（段已被压缩覆盖 BIOS），会从最老的段开始返回——
+    ///       那个案件的间隙由快照(catch-up)负责，这里只是尽力补。
+    /// </summary>
+    public List<LogMessage> ReadEventsFromSeq(long fromSeq)
+    {
+        var rows = new List<LogMessage>();
+        lock (_activeAppendLock)
+        {
+            foreach (var seg in _segments)
+            {
+                try { foreach (var evt in seg.ReadAll()) if (evt.Seq >= fromSeq) rows.Add(evt); }
+                catch { /* 段文件损坏跳过 */ }
+            }
+            if (_activeSegment is not null)
+            {
+                try { foreach (var evt in _activeSegment.ReadAll()) if (evt.Seq >= fromSeq) rows.Add(evt); }
+                catch { }
+            }
+        }
+        // 按 Seq 归序 + 同 Seq 去重（Compacted 与原始段可能重复覆盖）
+        return rows.OrderBy(e => e.Seq).GroupBy(e => e.Seq).Select(g => g.First()).ToList();
+    }
+
+    /// <summary>
     /// catch-up 快照写入：清空本账本所有段文件，整段重建（只含活账 e 事件 + Seq 保真）。
     /// 场景：新节点 join 后从 Leader 拿快照落盘回放。
     /// </summary>

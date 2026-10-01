@@ -234,8 +234,81 @@ public class MessageQueueHub
         PushEvent($"🧪 [snapshot] 应用集群快照：{snap.Queues.Count} 个账本已追赶");
     }
 
-    // ── 死信交换机执行器（QueueCore.SetDeadSink 挂进来的回调）──
-    //   routingKey = "dead.{来源队列}"，topic 通配匹配 → 命中的绑定队列收 DLQ 投递
+    // ═══ Delta Replay（掉队 follower 的补账引擎 · ISR/水位版）═══
+
+    /// <summary>
+    /// 从 WAL 把 follower 水位之后的漏事件补发（e/n/d 原序）。
+    /// · 调用方：sync-ack 端点（新节点 join 后的水位 seed）+ 巡查员（定期补掉队者）
+    /// · 从 Log.ReadEventsFromSeq 读事件 → 逐一 POST /api/cluster/replicate/{queue}
+    /// · 成功 → watermark 前进；失败 → 该 follower 继续 lagging，巡查员下轮重试
+    /// · 若 watermark 缺失（从未推给过这个 follower / 新节点 catch-up 已覆盖）→ 跳过该队列
+    /// </summary>
+    public async Task<int> ReplayDeltaToFollowerAsync(string followerUrl)
+    {
+        var repl = _replicator;
+        if (repl is null) return 0;
+
+        var replayed = 0;
+        foreach (var q in _queues.Values.ToList())
+        {
+            var wm = repl.WatermarkOf(followerUrl, q.QueueName);
+            if (wm is null || wm.Value < 0) continue;   // 无水位记录 → catch-up 快照负责，不做历史回放
+            var events = q.ReadEventsFromSeq(wm.Value + 1);
+            foreach (var evt in events)
+            {
+                try
+                {
+                    dynamic resp = await DynamicPush(followerUrl, q.QueueName, evt);
+                    if (!resp) break;                     // 推送异常：中断本队列，等待下轮巡查
+                    repl.SeedWatermark(followerUrl, q.QueueName, evt.Seq);
+                    replayed++;
+                }
+                catch { break; }
+            }
+        }
+        // 全队列都追上 → 解除 lagging（重新进入 ISR）
+        var stillBehind = _queues.Values.Any(q =>
+        {
+            var wm = repl.WatermarkOf(followerUrl, q.QueueName);
+            if (wm is null) return false;
+            return q.uptoSeqExistsAfter(wm.Value);
+        });
+        if (!stillBehind) repl.MarkLagging(followerUrl, false);
+        if (replayed > 0) PushEvent($"🔁 [delta-replay] {ShortUrl(followerUrl)} 补发 {replayed} 条事件");
+        return replayed;
+    }
+
+    /// <summary>巡查员（StartSweeper 每 tick 调用）：把掉队 follower 一次性补完。</summary>
+    public async Task SweepLaggingFollowersAsync()
+    {
+        if (_replicator is null) return;
+        foreach (var f in _replicator.LaggingFollowers().ToList())
+        {
+            try { await ReplayDeltaToFollowerAsync(f); }
+            catch { /* 该 follower 还是连不上，下轮再试 */ }
+        }
+    }
+
+    private string ShortUrl(string url)
+    {
+        var s = url.Replace("http://", "");
+        var c = s.IndexOf(':');
+        return c >= 0 ? s[..c] : s;
+    }
+
+    /// <summary>独立的单条事件推送（避免复用 ClusterReplicator 的 batch 语义）。</summary>
+    private async Task<bool> DynamicPush(string followerUrl, string queue, Persistence.LogMessage evt)
+    {
+        try
+        {
+            using var http = new System.Net.Http.HttpClient();
+            using var resp = await http.PostAsJsonAsync($"{followerUrl}/api/cluster/replicate/{queue}", evt);
+            return resp.IsSuccessStatusCode;
+        }
+        catch { return false; }
+    }
+
+    // ── 死信交换机执行器（QueueCore.SetDeadSink 挂进来的回调）──    //   routingKey = "dead.{来源队列}"，topic 通配匹配 → 命中的绑定队列收 DLQ 投递
     //   没有任何绑定命中 → 回退：回自家队列的死信账本（不弄丢尸体）
     public List<LogMessage> DeliverDead(MqMessage deadMsg, string fromQueue)
     {

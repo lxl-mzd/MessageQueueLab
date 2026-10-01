@@ -72,15 +72,7 @@ public class ClusterReplicator
                                                         : Math.Max(1, targets.Length / 2 + 1);
         var totalMembers = raft is not null ? raft.MemberCount : targets.Length + 1;
 
-        // ── Delta buffer：Syncing 成员的追赶事件种入缓冲队列（Leader 不丢任何事件）──
-        if (raft is not null)
-        {
-            foreach (var (node, url) in raft.GetSyncingMembers())
-            {
-                var dq = _pendingDelta.GetOrAdd(node, _ => new ConcurrentQueue<(string, LogMessage)>());
-                dq.Enqueue((queue, evt));
-            }
-        }
+
 
         // 并行传感器：每个 follower 一张“回执票”（POST；返回成功=真回执）
         var tasks = targets.Select(async f =>
@@ -97,49 +89,69 @@ public class ClusterReplicator
         }).ToList();
 
         var done = await Task.WhenAll(tasks);
+        // ── per-follower 水位推进 + ISR 剔除标记（Leader 视角） ──
+        for (var i = 0; i < targets.Length; i++)
+        {
+            var f = targets[i];
+            if (done[i] is not null)
+            {
+                var wm = _watermarks.GetOrAdd(f, _ => new ConcurrentDictionary<string, long>());
+                wm.AddOrUpdate(queue, evt.Seq, (_, old) => Math.Max(old, evt.Seq));
+                _lagging.TryRemove(f, out _);
+            }
+            else
+            {
+                _lagging[f] = 1;    // 推送失败 → 进 ISR 剔除名单（等待后台重放线程）
+            }
+        }
         ackedBy.AddRange(done.Where(x => x != null).Cast<string>());
 
         return new ReplicationResult(ackedBy.Count + 1, totalMembers, ackedBy);
     }
 
-    // ── Delta replay（catch-up 结束后回溯补发） ──
-    //    每个 Syncing 成员一份队列：join 起始时开始 buffer → sync-ack 后一次性补发 → 清空
-    private readonly ConcurrentDictionary<string, ConcurrentQueue<(string Queue, LogMessage Evt)>> _pendingDelta = new();
+    // ═══════════════════════════════════════════════════════════════
+    //  Raft 标准做法：**per-follower 复制水位**（Kafka 即 LEO/HW，Raft 即 nextIndex）
+    //
+    //    Leader 对每个 follower 记录每个队列的 lastAckSeq：
+    //      · 推送成功 → watermark 前进
+    //      · 推送失败 → follower 进 lagging 名单（ISR 剔除）→ 后台补发线程从水位处补
+    //      · sync-ack（新节点 catch-up 完成）→ 从 Leader 侧 seed 该新节点的初始水位
+    //
+    //    WAL 就是唯一的"buffer" —— append-only 永远在，掉队就从落后点读回来。
+    // ═══════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// Leader 收到 sync-ack 后调用：把 Buffer 中此成员的所有积压事件按序补发。
-    /// 返回补发条数。失败则中途停（剩余事件留队，可再次调用重试）。
-    /// </summary>
-    public async Task<int> ReplayDeltaToFollower(string followerNode, string followerUrl)
+    // followerUrl → (queue → lastAckedSeq)
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, long>> _watermarks = new();
+    // 掉队名单（ISR 剔除者）
+    private readonly ConcurrentDictionary<string, byte> _lagging = new();
+
+    public long? WatermarkOf(string followerUrl, string queue)
     {
-        if (!_pendingDelta.TryRemove(followerNode, out var deltaQueue) || deltaQueue.IsEmpty)
-        {
-            _pendingDelta.TryRemove(followerNode, out _);   // 确认清干净
-            return 0;
-        }
-
-        var replayed = 0;
-        while (deltaQueue.TryDequeue(out var item))
-        {
-            try
-            {
-                using var resp = await _http.PostAsJsonAsync(
-                    $"{followerUrl}/api/cluster/replicate/{item.Queue}", item.Evt);
-                if (!resp.IsSuccessStatusCode) { deltaQueue.Enqueue(item); break; }   // 失败：塞回去，退出
-                replayed++;
-            }
-            catch
-            {
-                deltaQueue.Enqueue(item);   // 网络故障：塞回去 = 剩余留给下次
-                break;
-            }
-        }
-
-        // 队列里剩余的事件如果已经全发完了清空
-        if (deltaQueue.IsEmpty) _pendingDelta.TryRemove(followerNode, out _);
-
-        return replayed;
+        return _watermarks.TryGetValue(followerUrl, out var wm) && wm.TryGetValue(queue, out var seq)
+            ? (long?)seq
+            : null;
     }
+
+    public void SeedWatermark(string followerUrl, string queue, long seq)
+    {
+        var wm = _watermarks.GetOrAdd(followerUrl, _ => new ConcurrentDictionary<string, long>());
+        wm.AddOrUpdate(queue, seq, (_, old) => Math.Max(old, seq));
+    }
+
+    public bool IsLagging(string followerUrl) => _lagging.ContainsKey(followerUrl);
+
+    public void MarkLagging(string followerUrl, bool lagging)
+    {
+        if (lagging) _lagging[followerUrl] = 1;
+        else _lagging.TryRemove(followerUrl, out _);
+    }
+
+    /// <summary>所有处于掉队状态的 follower URL（供巡查员补发循环消费）。</summary>
+    public List<string> LaggingFollowers() => _lagging.Keys.ToList();
+
+    /// <summary>该 follower 的所有队列的 watermark 快照（诊断用）。</summary>
+    public IReadOnlyDictionary<string, long> WatermarksFor(string followerUrl)
+        => _watermarks.TryGetValue(followerUrl, out var wm) ? (IReadOnlyDictionary<string, long>)new Dictionary<string, long>(wm) : new Dictionary<string, long>();
 }
 
 // ⭐ 未来加强点（生产级可切换）:

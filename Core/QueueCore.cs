@@ -271,6 +271,14 @@ public class QueueCore
     // 压缩巡查入口：交给所属 Wal Log 做双门槛判定（段数≥4 / 50% 脏率）
     public void SweepCompaction() => _ledger.SweepCompaction();
 
+    /// <summary>delta 回溯读（follower 补账用）：把本队列从 Seq ≥ fromSeq 起的所有 WAL 事件读出（含压缩段）。</summary>
+    public List<LogMessage> ReadEventsFromSeq(long fromSeq)
+        => _ledger.ReadEventsFromSeq(fromSeq);
+
+    /// <summary>该队列的 WAL 里是否还有 Seq ≥ fromSeq 的事件（用于 follower 是否已追平的判定）。</summary>
+    public bool uptoSeqExistsAfter(long fromSeq)
+        => _ledger.ReadEventsFromSeq(fromSeq).Count > 0;
+
     // ═══ catch-up 快照（新节点 join 场景，由 Leader 侧的 ApplySnapshot 调用） ═══
 
     public (List<(long Seq, MqMessage Msg)> Items, long UptoSeq) CaptureLedgerSnapshot()

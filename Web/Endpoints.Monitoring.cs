@@ -26,6 +26,8 @@ public static class MonitoringEndpoints
                     // ② 压缩巡查（纯磁盘 GC，不改任何业务状态——每个节点都各自扫各自的账本）
                     //    双门槛：已封段≥4 或（50% 脏率 +（行数≥128 / 段龄>1h））
                     hub.CompactAllChecks();
+                    // ③ Delta replay 巡查：掉队 follower（ISR 剔除者）从水位处补事件
+                    await hub.SweepLaggingFollowersAsync();
                 }
                 catch (Exception ex)
                 {

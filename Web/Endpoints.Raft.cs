@@ -115,26 +115,32 @@ public static class RaftEndpoints
         });
 
         // sync-ack：新挂成员在 catch-up 完成后上报自身状态
-        //   v5：接受其他成员的 sync-ack（Leader 记 Switch 到 member 表的 per-node _syncFlags）
-        //     → 同时触发 ClusterReplicator 的 Delta Replay（buffer 的追赶事件补发给该节点）
-        app.MapPost("/api/raft/sync-ack", (System.Text.Json.JsonElement body) =>
+        //   v5：**watermark 版** —— 新节点随包携带"自己已追平到各队列 Seq 值"，Leader seed 进 per follower 水位表；
+        //     然后把 sync-ack 时间点之后漏掉的事件（快照点到 sync-ack 的窗口）从 WAL 读出补发给新节点
+        app.MapPost("/api/raft/sync-ack", async (System.Text.Json.JsonElement body) =>
         {
             var nodeName = body.TryGetProperty("node", out var n) ? n.GetString() ?? "" : raft.NodeId;
             bool synced = body.TryGetProperty("synced", out var s) && s.GetBoolean();
 
-            // ① 记录成员同步水位（Leader 视角 per-member 追踪）
+            // ① 记录成员同步状态（Leader 视角 per-member 追踪，参与 Quorum 票池）
             raft.SetMemberSynced(nodeName, synced);
 
-            // ② 触发 Delta replay：把 join→sync-ack 之间的积压事件补发给该新成员
-            if (synced && hub.Replicator is not null)
+            // ② seed per-follower 水位（快照追到哪了 = 每队列 uptoSeq）
+            if (body.TryGetProperty("watermarks", out var wms) && wms.ValueKind == JsonValueKind.Object)
             {
-                var targetUrl = raft.Members.FirstOrDefault(m => m.Node == nodeName).Url;
-                if (!string.IsNullOrWhiteSpace(targetUrl))
+                var targetMember = raft.Members.FirstOrDefault(m => m.Node == nodeName);
+                var targetUrl = targetMember?.Url;
+                if (targetUrl is not null)
                 {
-                    _ = hub.Replicator.ReplayDeltaToFollower(nodeName, targetUrl);   // fire-and-forget 异步补发
+                    foreach (var q in wms.EnumerateObject())
+                    {
+                        if (q.Value.TryGetInt64(out var seq))
+                            hub.Replicator?.SeedWatermark(targetUrl, q.Name, seq);
+                    }
+                    // ③ 从水位处把"快照点 → 当前 Leader 水位"的漏事件补发（异步不阻塞 ack 返回）
+                    _ = hub.ReplayDeltaToFollowerAsync(targetUrl);
                 }
             }
-
             return Results.Ok(new { synced, node = nodeName });
         });
 

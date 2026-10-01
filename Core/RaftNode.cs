@@ -97,12 +97,11 @@ public sealed class RaftNode : IDisposable
 
     private static string ExtractHost(string url)
     {
-        // "http://node-1:8080" → "node-1"；"http://mq-0.mq-headless.default.svc:8080" → "mq-0.mq-headless.default.svc"
+        // "http://node-1:8080" → "node-1"；"http://mq-0.mq-headless.default.svc:8080" → "mq-0"
         var rest = url.Replace("http://", "").Replace("https://", "");
         var host = rest.Split('/')[0];
-        return host.Split('.')[0];   // k8s 的 DNS "mq-0.mq-headless..." 截第一段 = "mq-0"; compose 域名 "node-1:8080" 本身无点保持原样
-        var colon = host.IndexOf(':');
-        return colon >= 0 ? host[..colon] : host;
+        if (host.Contains(':')) host = host.Split(':')[0];   // 剥掉端口（compose："node-1:8080"→"node-1"，与 MQ_NODE_NAME 对齐）
+        return host.Split('.')[0];   // k8s 的 DNS "mq-0.mq-headless..." 截第一段 = "mq-0"
     }
 
     /// <summary>
