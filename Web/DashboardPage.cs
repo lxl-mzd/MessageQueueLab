@@ -144,6 +144,17 @@ function toggleAuto(){ autoOn=!autoOn; document.getElementById("tbtn").textConte
   resetTimer(); }
 
 async function jget(base, path){ try { const r = await fetch(base+path); return { code:r.status, body:await r.text() }; } catch(e){ return { code:0, body:"" }; } }
+// 经王转发：直连不通时，把请求发给看板所在的节点，由它在集群内网代查
+async function pforward(node, method, path, body){
+  try {
+    const r = await fetch("/api/admin/forward", { method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ node, method, path, body: body??null }) });
+    if (!r.ok) return { code:0, body:"" };
+    const j = await r.json();
+    return { code:j.code??0, body:j.body??"" };
+  } catch(e){ return { code:0, body:"" }; }
+}
 
 /* ── 集群汇总 + 每个节点卡片 ── */
 // 端口惯例：mq-N → 5081+N；node-N → 5080+N（node-1=5081 …）。
@@ -159,22 +170,30 @@ function portFor(name, idx){
   return String(5081 + idx);
 }
 async function refresh(){
-  let ports = NODES();
+  let items = NODES().map((p, i) => ({ name:"", port:p }));
   try {
     const mr = await jget("", "/api/raft/members");
     if (mr.code === 200){
       const mj = JSON.parse(mr.body);
       const names = (mj.table || mj.members || []).map(x => x.node || x.Node || x.name).filter(Boolean);
       if (names.length){
-        ports = names.map((nm, i) => portFor(nm, i));
-        document.getElementById("nodeports").value = ports.join(",");
+        const seen = new Set();
+        items = names.map((nm, i) => ({ name:nm, port:portFor(nm, i) }))
+                     .filter(x => !seen.has(x.port) && (seen.add(x.port), true));
+        document.getElementById("nodeports").value = items.map(x=>x.port).join(",");
       }
     }
   } catch(e){}
-    const rows = await Promise.all(ports.map(async p => {
-      const b = "http://"+location.hostname+":"+p;
+    const rows = await Promise.all(items.map(async it => {
+      const p = it.port, b = "http://"+location.hostname+":"+p;
       let [health, raft, queues] = await Promise.all([
         jget(b,"/health"), jget(b,"/api/raft/status"), jget(b,"/api/queues") ]);
+      let viaProxy = false;
+      if (health.code===0){   // 直连不通 → 经王转发（扩容后不用给新节点搭桥）
+        viaProxy = true;
+        [health, raft, queues] = await Promise.all([
+          pforward(it.name,"GET","/health"), pforward(it.name,"GET","/api/raft/status"), pforward(it.name,"GET","/api/queues") ]);
+      }
       if (raft.code!==200){        // 单机模式没有 raft 端点 → 用 cluster/status 兜底
         const cs = await jget(b,"/api/cluster/status");
         let cj=null; try{ cj=JSON.parse(cs.body); }catch(e){}
@@ -185,7 +204,7 @@ async function refresh(){
     try{ qj = queues.body?JSON.parse(queues.body):null; }catch(e){}
     const agg = { ready:0, locked:0, disk:0, dead:0 };
     (Array.isArray(qj)?qj:[]).forEach(q=>{ agg.ready+=q.readyInMemory; agg.locked+=q.lockedInMemory; agg.disk+=q.pendingOnDisk; agg.dead+=q.deadLetters; });
-    return { p, b, alive: health.code===200 && health.body.includes('"status":"alive"'),
+    return { p, b, name: it.name, viaProxy, alive: health.code===200 && health.body.includes('"status":"alive"'),
              raft: rj, sum: agg, queues: Array.isArray(qj)?qj:[] };
   }));
 
@@ -220,11 +239,12 @@ async function refresh(){
         +'<div class="cnt"><div class="n">'+r.sum.disk+'</div><div class="t">📒 主账</div></div>'
         +'<div class="cnt"><div class="n">'+r.sum.dead+'</div><div class="t">☠️ 死信</div></div>'
       +'</div>'
-      +'<div class="row2">'+(r.alive?'<span style="color:#86efac">🩺 HTTP 正常</span>':'<span style="color:#fca5a5">🩺 HTTP 失联</span>')+'</div>'
+      +'<div class="row2">'+(r.alive?'<span style="color:#86efac">🩺 HTTP 正常</span>':'<span style="color:#fca5a5">🩺 HTTP 失联</span>')
+      +(r.viaProxy&&r.alive?' <span style="color:#7dd3fc">· 经王转发</span>':'')+'</div>'
       +'<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">'
-        +'<button class="btn btn-blue"  onclick="readNode(\''+r.p+'\')">🩺 健康检查</button>'
-        +'<button class="btn btn-slate" onclick="eventsNode(\''+r.p+'\')">📜 事件流</button>'
-        +'<button class="btn btn-teal"  onclick="probeNode(\''+r.p+'\')">🧪 冒烟测试</button>'
+        +'<button class="btn btn-blue"  onclick="readNode(\''+e_esc(r.name)+'\',\''+r.p+'\')">🩺 健康检查</button>'
+        +'<button class="btn btn-slate" onclick="eventsNode(\''+e_esc(r.name)+'\',\''+r.p+'\')">📜 事件流</button>'
+        +'<button class="btn btn-teal"  onclick="probeNode(\''+e_esc(r.name)+'\',\''+r.p+'\')">🧪 冒烟测试</button>'
       +'</div>';
     grid.appendChild(div);
   });
@@ -241,7 +261,7 @@ async function refresh(){
 
   // 交换机
   if (first){
-    const exR = await jget("http://"+location.hostname+":"+first.p, "/api/ex");
+    const exR = await jget("", "/api/ex");
     let ex=[]; try{ ex=JSON.parse(exR.body); }catch(e){}
     const eb=document.getElementById("ex-body"); eb.innerHTML="";
     ex.forEach(e=>{
@@ -257,7 +277,7 @@ async function refresh(){
   const dlqRows=[]; const qsToScan=["normal","vip","error"];
   if (first) {
     for (const q of qsToScan){
-      const r = await jget("http://"+location.hostname+":"+first.p, "/api/q/"+q+"/dlq");
+      const r = await jget("", "/api/q/"+q+"/dlq");
       let l=[]; try{ l=JSON.parse(r.body); }catch(e){}
       l.forEach(d=> dlqRows.push({q, d}));
     }
@@ -278,17 +298,22 @@ function badgeText(role){
   return role;   // 直接 Leader / Follower / Candidate / Down
 }
 
-/* ── 运维按钮 ── */
+/* ── 运维按钮（直连不通自动经王转发） ── */
+async function jgetSmart(name, port, path){
+  const b = "http://"+location.hostname+":"+port;
+  const r = await jget(b, path);
+  if (r.code !== 0 || !name) return r;
+  return pforward(name, "GET", path);
+}
 async function dlqAct(q, id, kind){
-  const p = NODES()[0];
-  await fetch("http://"+location.hostname+":"+p+"/api/q/"+q+"/dlq/"+id+"/"+kind, { method:"POST" });
+  await fetch("/api/q/"+q+"/dlq/"+id+"/"+kind, { method:"POST" });
   toast(kind==="ack" ? "死信已销账" : "死信复活, count 归 0");
   setTimeout(refresh, 400);
 }
-async function readNode(p){
-  const [h, r] = await Promise.all([
-    jget("http://"+location.hostname+":"+p, "/health"),
-    jget("http://"+location.hostname+":"+p, "/api/raft/status")]);
+async function readNode(name, p){
+  let h = await jget("http://"+location.hostname+":"+p, "/health");
+  let r = await jget("http://"+location.hostname+":"+p, "/api/raft/status");
+  if (h.code===0 && name){ h = await pforward(name,"GET","/health"); r = await pforward(name,"GET","/api/raft/status"); }
   let lines = [];
   try {
     const hJson = JSON.parse(h.body||"{}");
@@ -305,13 +330,14 @@ async function readNode(p){
   } catch(e){ lines.push("raft/status 无法解析"); }
   openModal(":"+p+" · 健康检查", lines.join("\n"));
 }
-async function eventsNode(p){
-  const r = await jget("http://"+location.hostname+":"+p, "/api/events");
+async function eventsNode(name, p){
+  let r = await jget("http://"+location.hostname+":"+p, "/api/events");
+  if (r.code===0 && name) r = await pforward(name,"GET","/api/events");
   let rows=[]; try{ rows=JSON.parse(r.body); }catch(e){}
-  openModal("节点 :"+p+" · 最近事件 "+rows.length+" 条",
+  openModal("节点 "+(name||(":"+p))+" · 最近事件 "+rows.length+" 条",
     rows.slice(0,60).map(x=>x.ts+"  "+e_esc(x.msg)).join("\n") || "（空）");
 }
-async function probeNode(p){
+async function probeNode(name, p){
   const b="http://"+location.hostname+":"+p, tag="probe-"+Date.now();
   const w = await fetch(b+"/api/q/normal/messages", {method:"POST", headers:{"Content-Type":"application/json"},
                                                     body:JSON.stringify({content:tag})});
@@ -321,8 +347,7 @@ async function probeNode(p){
   else toast("冒烟异常：领取内容不匹配（可能是队列被长轮询占用）");
 }
 async function showClusterStatus(){
-  const p = NODES()[0];
-  const r = await jget("http://"+location.hostname+":"+p, "/api/cluster/status");
+  const r = await jget("", "/api/cluster/status");
   let lines = [];
   try {
     const s = JSON.parse(r.body||"{}");

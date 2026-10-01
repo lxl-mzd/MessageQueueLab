@@ -37,7 +37,7 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
         - name: mq
-          image: mq-lab:18
+          image: mq-lab:20
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080

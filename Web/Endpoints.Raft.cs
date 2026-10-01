@@ -168,5 +168,46 @@ public static class RaftEndpoints
                 return Results.Conflict(new { error = "仅 Leader 节点提供快照" });
             return Results.Json(hub.CaptureSnapshot());
         });
+
+        // ═══ 运维代查（看板经王转发）：POST /api/admin/forward {node, method, path, body?} ═══
+        //   看板只需要一个可达地址（5091 经 mq-write 到王），王用集群内网替浏览器问其他成员。
+        //   Raft 内部协议（投票/心跳/复制流/成员应用）禁止经此透传，防环路与误操作。
+        app.MapPost("/api/admin/forward", async (System.Text.Json.JsonElement req) =>
+        {
+            var node = req.TryGetProperty("node", out var n) ? n.GetString() ?? "" : "";
+            var method = req.TryGetProperty("method", out var m) ? (m.GetString() ?? "GET").ToUpperInvariant() : "GET";
+            var path = req.TryGetProperty("path", out var p) ? p.GetString() ?? "" : "";
+            string? body = req.TryGetProperty("body", out var b) && b.ValueKind == JsonValueKind.String
+                ? b.GetString() : null;
+            if (!path.StartsWith("/")) return Results.BadRequest(new { error = "path 必须以 / 开头" });
+            string[] blocked = ["/api/raft/vote", "/api/raft/heartbeat", "/api/cluster/replicate",
+                                "/api/raft/apply-membership", "/api/raft/join", "/api/raft/leave"];
+            if (blocked.Any(x => path.StartsWith(x, StringComparison.OrdinalIgnoreCase)))
+                return Results.StatusCode(403);
+            if (method != "GET" && method != "POST") return Results.BadRequest(new { error = "仅支持 GET/POST" });
+
+            string? url = node.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? node
+                : raft.Members.FirstOrDefault(x => x.Node == node)?.Url;
+            if (string.IsNullOrWhiteSpace(url)) return Results.NotFound(new { error = "未知成员", node });
+
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                using var msg = new HttpRequestMessage(
+                    method == "POST" ? HttpMethod.Post : HttpMethod.Get, url + path);
+                if (method == "POST")
+                    msg.Content = new StringContent(body ?? "",
+                        System.Text.Encoding.UTF8, "application/json");
+                using var resp = await ForwardHttp.SendAsync(msg, cts.Token);
+                return Results.Ok(new
+                {
+                    code = (int)resp.StatusCode,
+                    body = await resp.Content.ReadAsStringAsync(cts.Token),
+                });
+            }
+            catch (Exception ex) { return Results.Ok(new { code = 0, body = "", error = ex.Message }); }
+        });
     }
+
+    private static readonly HttpClient ForwardHttp = new();
 }

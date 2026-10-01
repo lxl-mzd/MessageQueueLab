@@ -72,15 +72,16 @@ if (ClusterOptions.Distributed)
     // ★ 把王座接进 ClusterOptions：写闸门（IsWriter）与复制流从此跟 Raft 王位联动
     ClusterOptions.Raft = raftNode;
 
-    // ★ 新节点自助 join-on-boot（空成员表 + 配置了 join URL）：异步等 Leader 通过后 catch-up
+    // ★ F2 自愈 + 新节点自助 join-on-boot（配置了 join URL 就启动）：
+    //    空表走老路 join；有表（重启/崩溃恢复，表可能是旧表）先 join 认领活表再 catch-up。
     //    必须等本节点 HTTP 服务真正监听后才启动 —— 否则 Leader 回推的 apply-membership
     //    打到还没开门的端口上丢失，本节点成员表永远是空的（join 成功但本地无表）。
-    if (raftNode.NeedsJoinAtBoot && ClusterOptions.LeaderUrl.Length > 0)
+    if (ClusterOptions.LeaderUrl.Length > 0)
     {
         var joinUrl = ClusterOptions.LeaderUrl;
         var lifetime = app.Services.GetRequiredService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>();
         lifetime.ApplicationStarted.Register(() =>
-            _ = raftNode.StartJoinAndCatchUpAsync(joinUrl, hub));
+            _ = raftNode.TryRejoinAtBootAsync(joinUrl, hub));
     }
 }
 
