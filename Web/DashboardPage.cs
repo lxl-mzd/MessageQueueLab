@@ -108,6 +108,9 @@ public static class DashboardPage
     <div class="scard" style="background:#334155"><div class="n" id="ag-alive">–</div><div class="t">🧭 存活节点 / Leader 状态</div></div>
   </div>
 
+  <h2>⚡ 集群资源（点击节点卡片头部可展开单机明细）</h2>
+  <div class="summary" id="cluster-res"><div class="sub">资源数据随刷新自动聚合……</div></div>
+
   <h2>🖥️ 服务器节点（每台一份，可逐台操作）</h2>
   <div class="nodegrid" id="nodegrid"></div>
 
@@ -125,7 +128,7 @@ public static class DashboardPage
 
   <h2>📜 事件流水（最近 200 条 · 来源当前 Leader 节点）</h2>
   <div id="feed"></div>
-  <div class="sub" style="margin-top:12px">数据接口：<code>/health</code> <code>/api/raft/status</code> <code>/api/queues</code> <code>/api/events</code> <code>/api/q/{q}/dlq</code></div>
+  <div class="sub" style="margin-top:12px">数据接口：<code>/health</code> <code>/api/raft/status</code> <code>/api/queues</code> <code>/api/events</code> <code>/api/q/{q}/dlq</code> <code>/api/monitoring/resources</code></div>
 </div>
 
 <div id="modal"><div class="box"><h2 id="m-title"></h2><pre id="m-body"></pre>
@@ -137,6 +140,52 @@ const NODES = () => document.getElementById("nodeports").value.split(",").map(s=
 let timer = setInterval(refresh, 15000), autoOn = true;
 let toastT = null;
 function e_esc(s){ const d=document.createElement("span"); d.textContent = s??""; return d.innerHTML; }
+/* ── 资源饼图 helpers ── */
+function fmtBytes(b){ b=+b||0; if(b<1024) return b+"B"; const u=["KB","MB","GB","TB"]; let i=-1; do{ b/=1024; i++; }while(b>=1024&&i<u.length-1); return b.toFixed(1)+u[i]; }
+function fmtBps(b){ b=+b||0; if(b<1000) return b+"bps"; const u=["Kbps","Mbps","Gbps"]; let i=-1; do{ b/=1000; i++; }while(b>=1000&&i<u.length-1); return b.toFixed(1)+u[i]; }
+function donut(pct, color, label){
+  pct = Math.max(0, Math.min(100, +pct||0));
+  return '<div style="display:flex;flex-direction:column;align-items:center;gap:4px;min-width:96px">'
+    +'<div style="width:84px;height:84px;border-radius:50%;background:conic-gradient('+(color||"#38bdf8")+' 0 '+pct.toFixed(1)+'%, #1e293b '+pct.toFixed(1)+'% 100%);display:flex;align-items:center;justify-content:center">'
+    +'<div style="width:58px;height:58px;border-radius:50%;background:#0f172a;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px">'+pct.toFixed(0)+'%</div></div>'
+    +'<div class="mini" style="text-align:center">'+label+'</div></div>';
+}
+function resCpuPct(r){ if(!r||!r.cpu) return null; const c=r.cpu; return (c.systemPercent??c.processPercent); }
+function resDonuts(r, compact){
+  if(!r) return '<div class="sub">该节点资源接口无响应</div>';
+  const cpu = resCpuPct(r);
+  const cpuNote = (r.cpu.systemPercent!=null?"系统":"进程") + " · " + r.cpu.cores + "核";
+  const mem = r.memory||{}, dsk = r.disk||{}, net = r.network||{};
+  let h = '<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start">';
+  h += donut(cpu, "#38bdf8", "⚙️ CPU<br>"+e_esc(cpuNote));
+  h += donut(mem.percent||0, "#a78bfa", "🧠 内存<br>"+fmtBytes(mem.usedBytes)+"/"+fmtBytes(mem.totalBytes));
+  h += donut(dsk.percent||0, "#34d399", "💾 磁盘<br>"+fmtBytes(dsk.usedBytes)+"/"+fmtBytes(dsk.totalBytes));
+  if (net.totalSpeedBps) h += donut(Math.min(100,(net.rxBytesPerSec+net.txBytesPerSec)*8/Math.max(1,net.totalSpeedBps)*100), "#fbbf24", "🌐 带宽<br>↓"+fmtBps(net.rxBytesPerSec*8)+" ↑"+fmtBps(net.txBytesPerSec*8));
+  else h += '<div style="display:flex;flex-direction:column;align-items:center;gap:4px;min-width:96px"><div class="mini">🌐 带宽<br>↓'+fmtBps(net.rxBytesPerSec*8)+' ↑'+fmtBps(net.txBytesPerSec*8)+'<br>（无标称总量）</div></div>';
+  h += "</div>";
+  if (!compact) h += '<div class="mini" style="margin-top:6px">磁盘路径 '+e_esc(dsk.path||"")+' · 网卡 '+((net.nics||[]).length)+' 块 · CPU 进程占用 '+(r.cpu.processPercent??"–")+'%</div>';
+  return h;
+}
+function renderClusterRes(rows){
+  const box = document.getElementById("cluster-res");
+  const rs = rows.filter(r=>r.res).map(r=>r.res);
+  if (!rs.length){ box.innerHTML = '<div class="sub">暂无节点资源数据</div>'; return; }
+  let cores=0, cpuW=0, memU=0, memT=0, dskU=0, dskT=0, rx=0, tx=0, spd=0, spdN=0;
+  rs.forEach(r=>{
+    const c=r.cpu||{}; cores+=c.cores||0; cpuW+=(resCpuPct(r)||0)*(c.cores||0);
+    memU+=r.memory?.usedBytes||0; memT+=r.memory?.totalBytes||0;
+    dskU+=r.disk?.usedBytes||0; dskT+=r.disk?.totalBytes||0;
+    rx+=r.network?.rxBytesPerSec||0; tx+=r.network?.txBytesPerSec||0;
+    if (r.network?.totalSpeedBps){ spd+=r.network.totalSpeedBps; spdN++; }
+  });
+  const agg = { cpu:{ cores, systemPercent: null, processPercent: cores?cpuW/cores:0 },
+    memory:{ usedBytes:memU, totalBytes:memT, percent: memT?memU/memT*100:0 },
+    disk:{ usedBytes:dskU, totalBytes:dskT, percent: dskT?dskU/dskT*100:0, path:"Σ" },
+    network:{ rxBytesPerSec:rx, txBytesPerSec:tx, totalSpeedBps: spdN?spd:null, nics:[] } };
+  box.innerHTML = '<div class="scard" style="background:#0f172a;flex:1;min-width:280px"><div class="t" style="margin-bottom:8px">⚡ 全集群资源（'+rs.length+'/'+rows.length+' 节点上报）</div>'
+    + resDonuts(agg, true) + "</div>";
+}
+function toggleRes(p){ const d=document.getElementById("res-"+p); if(d) d.style.display = d.style.display==="none"?"block":"none"; }
 function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg; t.style.display="block";
   clearTimeout(toastT); toastT=setTimeout(()=>t.style.display="none", 2600); }
 function resetTimer(){ clearInterval(timer); if(autoOn) timer=setInterval(refresh, +document.getElementById("interval").value); }
@@ -199,26 +248,27 @@ async function refresh(){
   }
     const rows = await Promise.all(items.map(async it => {
       const p = it.port, b = "http://"+location.hostname+":"+p;
-      let [health, raft, queues] = await Promise.all([
-        jget(b,"/health"), jget(b,"/api/raft/status"), jget(b,"/api/queues") ]);
+      let [health, raft, queues, res] = await Promise.all([
+        jget(b,"/health"), jget(b,"/api/raft/status"), jget(b,"/api/queues"), jget(b,"/api/monitoring/resources") ]);
       let viaProxy = false;
       if (health.code===0){   // 直连不通 → 经王转发（扩容后不用给新节点搭桥）
         viaProxy = true;
-        [health, raft, queues] = await Promise.all([
-          pforward(it.name,"GET","/health"), pforward(it.name,"GET","/api/raft/status"), pforward(it.name,"GET","/api/queues") ]);
+        [health, raft, queues, res] = await Promise.all([
+          pforward(it.name,"GET","/health"), pforward(it.name,"GET","/api/raft/status"), pforward(it.name,"GET","/api/queues"), pforward(it.name,"GET","/api/monitoring/resources") ]);
       }
       if (raft.code!==200){        // 单机模式没有 raft 端点 → 用 cluster/status 兜底
         const cs = await jget(b,"/api/cluster/status");
         let cj=null; try{ cj=JSON.parse(cs.body); }catch(e){}
         if (cj) raft = { code:200, body: JSON.stringify({ node:cj.node||(":"+p), role:(cj.role==="Leader"||cj.role==="single")?"Leader":cj.role, term:"–", leaderId:cj.node }) };
       }
-      let rj=null, qj=null;
+      let rj=null, qj=null, rsj=null;
     try{ rj = raft.body?JSON.parse(raft.body):null; }catch(e){}
     try{ qj = queues.body?JSON.parse(queues.body):null; }catch(e){}
+    try{ rsj = res.body?JSON.parse(res.body):null; }catch(e){}
     const agg = { ready:0, locked:0, disk:0, dead:0 };
     (Array.isArray(qj)?qj:[]).forEach(q=>{ agg.ready+=q.readyInMemory; agg.locked+=q.lockedInMemory; agg.disk+=q.pendingOnDisk; agg.dead+=q.deadLetters; });
     return { p, b, name: it.name, viaProxy, alive: health.code===200 && health.body.includes('"status":"alive"'),
-             raft: rj, sum: agg, queues: Array.isArray(qj)?qj:[] };
+             raft: rj, sum: agg, queues: Array.isArray(qj)?qj:[], res: rsj };
   }));
 
   // 汇总
@@ -231,6 +281,7 @@ async function refresh(){
   document.getElementById("ag-dead").textContent=agDead;
   document.getElementById("ag-alive").innerHTML = '<span style="color:'+(kingN===1?'#86efac':'#fca5a5')+'">'
     + aliveN+'/'+rows.length+' 在线 · '+(kingN===1?'Leader unique':'Leader missing or multiple')+'</span>';
+  try{ renderClusterRes(rows); }catch(e){}
 
   // 节点卡片
   const grid = document.getElementById("nodegrid"); grid.innerHTML="";
@@ -239,9 +290,9 @@ async function refresh(){
     const cls  = role==="Leader"?"b-king":(role==="Follower"?"b-follower":(role==="Candidate"?"b-candidate":"b-dead"));
     const div=document.createElement("div"); div.className="node";
     div.innerHTML =
-      '<div class="hdr" style="display:flex;justify-content:space-between;align-items:center">'
+      '<div class="hdr" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="toggleRes(\''+e_esc(r.p)+'\')" title="点击展开/收起单机资源">'
         +'<div><div class="name">'+e_esc(r.raft?r.raft.node:(":"+r.p))+'</div>'
-        +'<div class="mini">http://'+location.hostname+':'+e_esc(r.p)+'</div></div>'
+        +'<div class="mini">http://'+location.hostname+':'+e_esc(r.p)+' · ▼资源</div></div>'
         +'<div style="text-align:right"><span class="badge '+cls+'">'+e_esc(badgeText(role))+'</span>'
         +'<div class="mini" style="margin-top:6px">term='+(r.raft?r.raft.term:"–")
         +' &nbsp; leader='+(r.raft?(r.raft.leaderId||"-"):"-")+'</div></div>'
@@ -254,6 +305,7 @@ async function refresh(){
       +'</div>'
       +'<div class="row2">'+(r.alive?'<span style="color:#86efac">🩺 HTTP 正常</span>':'<span style="color:#fca5a5">🩺 HTTP 失联</span>')
       +(r.viaProxy&&r.alive?' <span style="color:#7dd3fc">· 经王转发</span>':'')+'</div>'
+      +'<div id="res-'+e_esc(r.p)+'" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid #1e293b">'+resDonuts(r.res)+'</div>'
       +'<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">'
         +'<button class="btn btn-blue"  onclick="readNode(\''+e_esc(r.name)+'\',\''+r.p+'\')">🩺 健康检查</button>'
         +'<button class="btn btn-slate" onclick="eventsNode(\''+e_esc(r.name)+'\',\''+r.p+'\')">📜 事件流</button>'
