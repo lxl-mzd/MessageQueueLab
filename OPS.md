@@ -1,50 +1,52 @@
 # 自造消息队列 · 部署与运维手册（OPS.md）
 
-> 适用版本：mq-lab v4+（动态主权 Raft / Quorum 三阶段 / 幂等查重 / DLX 死信交换机 / 元数据持久化）
-> 读者：部署这套消息队列的工程师 / 值班运维 / 偶尔看一眼的微服务同学
+> 适用版本：mq-lab v5+（动态成员 Raft / watermark+ISR 掉队回放 / K8s StatefulSet 部署）
+> 读者：部署这套消息队列的运维 / 兼值运营 / 微服务接入同学
+>
+> 相关文档：`README.md`（定位）· `ARCHITECTURE.md`（架构图）· `DESIGN.md`（设计全文）· `API.md`（接口）· `K8S_SCALE.md`（K8s 扩缩容流程）
 
 ---
 
-## 0. 三分钟版（懒得看全文）
+## 0. 三分钟速查
 
 ```bash
-# 单机拉起（服务器上有 docker 就行，拉我们的成品镜像）
+# 单机（有 docker 即起）
 docker run -d --name mq-server -p 5000:8080 -v mqlab-data:/app/data \
     ghcr.io/lxl-mzd/messagequeue-lab:latest
-# 验证
 curl http://localhost:5000/health
-浏览器开 http://localhost:5000/     # 健康看板
 
-# 三节点集群（生产形态）
+# 三节点 compose（生产形态）
 git clone https://github.com/lxl-mzd/MessageQueueLab.git
 cd MessageQueueLab && docker compose up -d --build
 
-# 日常巡检三连
-docker compose ps                              # 三容器全 Up
-curl http://127.0.0.1:5081/api/raft/status     # 恰好一个 Leader
-curl http://127.0.0.1:5081/api/queues          # 各队列计数
-```
+# k8s（StatefulSet 部署）
+kubectl apply -f k8s/mq-headless-svc.yaml
+kubectl apply -f k8s/mq-write-svc.yaml
+kubectl apply -f k8s/mq-statefulset.yaml
 
-读完全文你还会知道：怎么升级不中断、怎么备份恢复、哪些指标该配告警。
+# 日常巡检三连
+docker compose ps
+curl http://127.0.0.1:5081/api/raft/status
+curl http://127.0.0.1:5081/api/queues
+```
 
 ---
 
-## 1. 部署
+## 1. 部署（三种形态）
 
-### 1.1 选形态
+### 1.1 形态抉择
 
-| 形态 | 什么时候用 | 特征 |
+| 形态 | 场景 | 特征 |
 |---|---|---|
-| **单节点** | 开发/测试环境、能容忍挂掉后人工重启 | 1 个容器，无 Raft |
-| **三节点**（生产推荐） | 正式微服务链路、不能丢消息 | Raft 自动选王，任意 1 台宕机零中断 |
+| **单节点**（`MQ_ROLE=single`） | 开发 / 测试 / 业务量小 | 无 Raft |
+| **docker-compose 三节点** | 正式微服务链路（小团队） | 每节点独立卷，Raft 动态成员自动起用 |
+| **K8s StatefulSet** | 需要自动扩缩容 / 复杂网络/节点迁移 | 配合 `kubectl scale --replicas=N` 做动态集群 |
 
-三节点硬性前提：**三套副本要尽量独立**。最忌讳三个容器挤同一台宿主机——宿主机断电等于三副本一起死，高可用变装饰。
+> K8s 部署请配合 Kafka 风格的 `mq-headless`（稳定 DNS）+ `mq-write`（readiness 过滤王）Service —— 详见 `K8S_SCALE.md`。
 
 ### 1.2 单机部署
 
 ```bash
-docker pull ghcr.io/lxl-mzd/messagequeue-lab:latest
-
 docker run -d --name mq-server \
     -p 5000:8080 \
     -v mqlab-data:/app/data \
@@ -53,134 +55,166 @@ docker run -d --name mq-server \
     ghcr.io/lxl-mzd/messagequeue-lab:latest
 ```
 
-- `-v mqlab-data:/app/data` **千万别少**（WAL 账本 + 死信账本 + 交换机快照全在里面）
-- `--restart unless-stopped` 让 docker daemon 重启后自动拉起服务
+- `-v` 数据卷：**含 WAL + 死信账本 + 交换机快照 + Raft 成员表**（一个都不能少）
 
-### 1.3 三节点集群（docker-compose）
+### 1.3 docker-compose 三节点
 
-仓库里的 `docker-compose.yml` 已经写好一键三节点（宿主机端口 5081/5082/5083），关键环境变量：
+```bash
+git clone https://github.com/lxl-mzd/MessageQueueLab.git
+cd MessageQueueLab && docker compose up -d --build
+```
 
-| 变量 | 说明 | 出错后果 |
+配置表（`docker-compose.yml` 中）：
+| 变量 | 值 | 出错后果 |
 |---|---|---|
-| `MQ_PEERS` | Raft 全员表（**每个节点都要配全 3 员，含自身**） | 少一个 → 脑裂出双王 |
-| `MQ_SELF` | 本节点对外地址（Raft 用来把"自己"剥掉） | Leader 会自投心跳把自己降级 → 反复重选 |
-| `MQ_NODE_NAME` | 日志看板上的节点名 | 只是显示 |
-| `MQ_ROLE` | 初始角色声明 | 只影响首现写入口；Raft 定身后以王为准 |
+| `MQ_PEERS` | `http://node-1:8080,http://node-2:8080,http://node-3:8080` | 少一个 → 脑裂双王 |
+| `MQ_SELF` | 每台指向自身 | Leader 自投心跳自降 → 反复重选 |
+| `MQ_NODE_NAME` | node-1/2/3 | 日志看板分机识别 |
+| `MQ_ROLE` | leader/follower | 动态主权下只影响首写入口，王位接管后以 Raft 王为准 |
 
-三个要点：
-1. **MQ_PEERS 三节点必须完全一致**（写错一个字就脑裂）。
-2. 生产建议三台独立机器各跑 1 个节点，而不是同宿主机 3 容器。
-3. 端口暴露建议只暴露**王所在的那一个**给业务方（其他两台 follower 本身不收业务写）。
-
-### 1.4 微服务接入方式
+### 1.4 K8s 部署（StatefulSet）
 
 ```bash
-# 发消息（强烈建议带 key 作为业务幂等键）
-curl -X POST http://<leader>:5000/api/q/orders/messages \
-    -H "Content-Type: application/json" \
-    -d '{"content":"创建订单","key":"order-12345"}'
-
-# 消费（长轮询 5 秒 + 可见性 30 秒）
-curl -X POST "http://<node>:5000/api/q/orders/receive?waitMs=5000&visibilitySeconds=30"
-
-# 销账
-curl -X POST "http://<node>:5000/api/q/orders/ack/{id}"
+kubectl apply -f k8s/mq-headless-svc.yaml
+kubectl apply -f k8s/mq-write-svc.yaml
+kubectl apply -f k8s/mq-statefulset.yaml
 ```
 
-入口选择：
-- **方式 A**：DNS 指向当前王（需外部脚本做 failover 漂移）
-- **方式 B（推荐，零依赖）**：客户端拿到 503 / 连接失败自动换下一个节点重试（503 = "我不是王"），SDK 内置即可
+部署细节（`k8s/mq-statefulset.yaml` 内）—— 三个关键开关，缺一个就跑不起来：
 
-### 1.5 镜像与回滚
+1. **PVC 逐 Pod 独立挂载**（`volumeClaimTemplates`）—— Pod 重启自动绑回自己的卷
+2. `podManagementPolicy: Parallel` —— 防止 OrderedReady 模式下"#
+   第一个 Pod NotReady → 后面的 Pod 检查不通过永远不建"
+3. `publishNotReadyAddresses: true`（headless Service 里）—— 否则 3 follower 都 NotReady（无王）时互 ping 不通
 
-```bash
-docker pull ghcr.io/lxl-mzd/messagequeue-lab:latest       # 最新
-docker pull ghcr.io/lxl-mzd/messagequeue-lab:<git-sha>    # 时光机，回滚用
-```
-
-要固定版本，把 compose 里的 tag 写成具体 sha 再 up，不 pin `latest`。
+readinessProbe 指向 `/api/raft/write-ready`（`mq-write` Service 自动把流量跟王走）。
 
 ---
 
-## 2. 常规运维
+## 2. 运维
 
-### 2.1 健康检查清单（每天一次）
+### 2.1 每日巡检（5 项）
 
-| 检查项 | 方法 | 健康值 |
-|---|---|---|
-| 探活 | `GET /health` ×3 | 200 且 `"status":"alive"` |
-| 王位 | `GET /api/raft/status` ×3 | **恰好 1 个 role=Leader**；term 三节点一致或 ±1 |
-| 复制同步 | `GET /api/queues` ×3 | follower 的 `pendingOnDisk` 与王差距不悬殊 |
-| 死信 | `GET /api/queues` 的 `deadLetters` | 增长 <10 条/分钟；持续堆积需人工处理 |
-| 磁盘 | data 卷容量 | <80%（WAL 压缩兜不住磁盘满） |
+```bash
+for port in 5081 5082 5083; do
+  curl -s http://localhost:$port/health
+  curl -s http://localhost:$port/api/raft/status
+  curl -s http://localhost:$port/api/queues
+done
+curl -s http://localhost:5081/api/events
+```
 
-看板直接浏览器开 http://host:5081/ 静态浏览，等价于以上手工。
+判定健康：
+- **恰好一个 Leader**（"role":"Leader"只出现一次）
+- term 三节点相同或±1（选举无频繁抖动）
+- `pendingOnDisk` 三节点差距 ≤10（复制无积压）
+- `deadLetters` 不持续上升（下游没挂）
+- WAL 磁盘 <80%（WAL 压缩兜不住磁盘满）
 
-### 2.2 告警阈值建议
+### 2.2 告警阈值（建议抄监控）
 
-1. 任一节点 `/health` 超 30 秒无响应 → P1（业务写不停但副本少一份）
-2. raft `leaderId` 30 秒内连续变化 → P1（选主抖动，查网络）
-3. data 卷 >80% → P0
-4. `deadLetters` 持续增长 → P2（下游挂了）
-5. `pendingOnDisk` 三节点差 >100 → P2（复制断流）
+1. 任一节点 `/health` >30s 无响应 → P1
+2. `leaderId` 30 秒内翻转 2 次 → P1（选主抖动）
+3. WAL 磁盘 >80% → P0
+4. `deadLetters` >10/分钟 → P2（下游挂了）
+5. `pendingOnDisk` 各节点差 >100 → P2（复制积压）
+6. `members` 表出现重复 node 名 → P1（脑裂）
 
-### 2.3 运维操作（金句五连）
+### 2.3 运维动作五连
 
 ```bash
 # 死信复活
-curl -X POST http://<leader>:5000/api/q/orders/dlq/<id>/revive
-
-# 死信删除（人工确认后）
-curl -X POST http://<leader>:5000/api/q/orders/dlq/<id>/ack
-
-# 动态建队（立即生效；重启自动认领）
-curl -X POST http://<leader>:5000/api/q/audit
-
-# 改 DLX 死信路由（持久化，重启不掉）
-curl -X POST "http://<leader>:5000/api/ex/dead/bind?pattern=dead.urgent&queue=error"
-
-# 解绑
-curl -X POST "http://<leader>:5000/api/ex/dead/unbind?pattern=dead.urgent&queue=error"
+curl -X POST http://<master>:5000/api/q/audit/dlq/<id>/revive     # retryCount 归 0
+# 死信销账
+curl -X POST http://<master>:5000/api/q/audit/dlq/<id>/ack
+# 动态建队
+curl -X POST http://<master>:5000/api/q/audit
+# 改绑定（持久化 _exchanges.json）
+curl -X POST http://<master>:5000/api/ex/dead/bind?pattern=dead.urgent&queue=error
+curl -X POST http://<master>:5000/api/ex/dead/unbind?pattern=dead.urgent&queue=error
 ```
 
-幂等说明：服务端日志出现 `🧊 幂等拦截` 是**正常防护**（同一条消息重复被提出/重复 ack），不是故障——业务侧需要的是核对幂等键而不是报障。
+幂等日志说明：`🧊 幂等拦截` 是**正常防护动作**（同 id 重复出现被挡回），不是故障。
 
 ---
 
 ## 3. 备份与灾难恢复
 
+### 3.1 每日备份
+
 ```bash
-# 每天一次（任一节点）
 docker run --rm -v mqlab-leader:/data -v $PWD/backup:/backup alpine \
     tar czf /backup/mqlab-leader-$(date +%F).tar.gz -C /data .
 ```
 
-**灾难恢复（纯空机器）**：
+### 3.2 空机恢复（从 TAR 还原）
+
 ```bash
 mkdir -p $PWD/data
 tar xzf mqlab-leader-2026-09-24.tar.gz -C $PWD/data
-docker run -d -p 5000:8080 -v $PWD/data:/app/data mqlab-latest
-# 启动日志应出现 📇 磁盘认领 ... 队列（目录在即认领）
+
+docker run -d --name mq-server -p 5000:8080 -v $PWD/data:/app/data \
+    -e MQ_ROLE=single \
+    ghcr.io/lxl-mzd/messagequeue-lab:latest
+# 启动日志：📇 磁盘认领 audit / ... 队列（目录在即挂账）
 ```
 
-> ⚠️ **如果三台节点的 WAL 磁盘都毁掉（且没备份）** —— 那就是数据全没。
-> 所以**每天备份是必须的**。3 节点 Quorum 只保证"短窗口单机故障不丢"，不给"全清空"兜底。
+### 3.3 数据卷结构（备份会拷走的东西）
+
+```
+/app/data/
+├── _cluster/
+│   └── members.json          ★ Raft 成员表持久化（动态主权）
+├── _exchanges.json           ★ 交换机/绑定快照
+├── normal/
+│   ├── s000001.jsonl …       ★ WAL 分段
+│   └── c1-4.compacted.jsonl  ★ WAL 压缩产物
+├── normal.dlq/               死信账本
+├── vip/ vip.dlq/
+└── error/ error.dlq/
+```
 
 ---
 
-## 4. 升级流程
+## 4. 扩容 / 缩容（K8s StatefulSet）
 
-**铁律：`docker compose down` 永远不带 `--volumes`**（删数据卷 = 删账本），日常用 `stop`。
+### 4.1 扩容（3 → 4）
 
+```bash
+kubectl scale statefulset mq --replicas=4
+kubectl logs mq-3 -f    # 应出现：
+#   🧪 [raft:mq-3] join 模式：空成员表启动
+#   📇 [membership] seq=2 成员表更新 mq-0..mq-3
+#   🧪 [snapshot] 应用集群快照：6 个账本已追赶
+#   🎉 [raft:mq-3] join + catch-up 完成 —— 正式入列
 ```
-1. 预检：/health ×3 全 200 + 做第 3 节备份 + deadLetters 不在突增
-2. 先升两个 follower（stop → pull → up），逐个来，整体不中断
-   （期间 production 实际约 503 一次，客户端重试即可）
-3. 升级王节点：docker compose stop mq-leader → pull 新镜像 → up
-   （新王 ≤12s 自动选出，老王起来自动降级回 Follower，这是设计的）
-4. 冒烟：写一条消息 → 三节点 /api/queues pendingOnDisk 对齐
-5. 观察 /api/events 半分钟无 Quorum 未达
+
+**注意**：mq-3 在 `synced=false`（catch-up 未完成）时：
+- 不参与 Raft 投票（vote RPC 返回 false）
+- 不参与写 Quorum（`PublishTargets` 自动排除）
+- write-ready = 503，Pod NotReady（业务流量不会打到它）
+
+catch-up 完成 `synced=true` → Pod Ready → 正式可接请求。
+
+### 4.2 缩容（4 → 3）
+
+```bash
+kubectl scale statefulset mq --replicas=3
+# StatefulSet 杀最高序号的 Pod（mq-3）→ 发 SIGTERM
+# .NET ApplicationStopping → GracefulOfflineAsync
+#   Follower：向 Leader 发 leave → Leader Quorum 重写成员表（去 mq-3）→ mq-3 自退出
+#   Leader（若被杀节点是自己）：m 事件去自己 → 剩余成员重选王 → 退出
 ```
+
+### 4.3 扩缩容的票数数学
+
+| 集群规模 | 写 Quorum 需要的 `ackCount` |
+|---|---|
+| 3 节点 | 2 票 |
+| 4 节点 | 3 票 |
+| 5 节点 | 3 票 |
+
+公式：`(floor(已同步者数/2) + 1)`；未追平的成员 **不计票**（Stage: `_syncFlags[node] == false`）。
 
 ---
 
@@ -188,40 +222,30 @@ docker run -d -p 5000:8080 -v $PWD/data:/app/data mqlab-latest
 
 | 症状 | 最可能原因 | 处理 |
 |---|---|---|
-| 所有节点写 503 | Raft 还没选出王（网络不通/全员表错） | 等 30~60s；查 MQ_PEERS 与网络互通 |
-| `/raft/status` 出现 2 个 Leader | MQ_PEERS 配错 → 节点互不相识（脑裂） | 修配置 + 重启受影响节点 |
-| 写 503 但 raft 正常 | 业务请求打到了非王节点 | 用客户端轮转（1.4 方式 B）或 DNS 漂移 |
-| 三节点 `pendingOnDisk` 不一致 | follower 离线窗口丢复制 | **catch-up 未实现**（见 Road）；短期做完整性对账，或删卷重做 follower |
-| 大量 `🧊 幂等拦截` | 客户端重复 send/ack | 正常防护日志，不是故障 |
-| 每秒日志一行同一句 | 服务起欢了但有端口竞争 | 杀掉重复进程 / 查占用 |
-| `☠️ DLX dead` 频繁 | 业务消息反复 nack | 下游处理坏了，看 2.1 死信清单 |
+| 全部节点写 503 | Raft 选不出王 | 查 `MQ_PEERS` 或网络；30~60 秒内自动收敛 |
+| 发现 2 个 Leader | 脑裂 | 查 `MQ_PEERS` 是否所有人一致；重启受影响节点 |
+| 复制滞后 pendingOnDisk 差 >100 | follower 掉线 delta replay 没跟上 | `/api/raft/members` 查 synced；查 MW PEERS 网络 |
+| 死信连续上升 | 下游业务处理挂 | 抄 2.3 复活 / 销账；或手动 kill 下游 |
+| 日志"🧊 幂等拦截" | 消费者重复/ttl 幽灵 | 正常防护动作（不是故障） |
+| m event 循环 | 串行变更锁未释放 | 重启受影响节点 |
 
 ---
 
-## 5.1 (附) 已知限制（诚实清单）
+## 6. CI/CD 与版本
 
-1. **follower 离线丢账补不回来**：follower 挂期间 leader 收的新事件不追平（catch-up Road 未做）。建议用 quorum 三副本时业务侧"全量校验"兜底。
-2. **元数据（/exchanges.json）节点间不同步**：各节点各写自盘；改绑定要在王节点或全员执行。
-3. **鉴权未实现**：生产务必内网部署，或加反向代理做 API-Key。
-
----
-
-## 6. 版本管理
-
-- 镜像 tag：`latest`（最新）、`<git-sha>`（精确回滚时光机）。
-- WAL 格式是 data contract，跨版本升级前必须**先做备份**（第 3 节）。
-- CI 绿构则说明代码是"非烂"状态；release passing = 镜像能跑。仓库每次 push 自动升级。
+- 每次 main push：**24 项单测** + **三节点 e2e 冒烟**（Raft / Quorum / DLX / 杀王接管）
+- 全绿后推 GHCR：`ghcr.io/lxl-mzd/messagequeue-lab:{latest, <sha>}`
+- 升级：`docker compose pull && up -d`（或指定 sha 的镜像）
 
 ---
 
-## 一句话总纲
+## 一句话总结
 
 ```
-正常运行：什么也不用做（除非要改绑定或建队列）
-节点崩溃：Raft 自动自愈，回头的节点自动降级复制
-磁盘挂掉：用第 3 节的备份恢复（磁盘挂掉 = 冷备回填）
-告警五条 = 第 2.2 节，齐了
-升级四步 = 第 4 节，齐了
+正常运行：什么都不用管
+节点宕机：Raft 自动切王；回头的节点 join+catch-up 自愈
+磁盘毁掉：从备份恢复（data/ 卷整体是真相）
+告警：   2.2 的五条，齐了
 ```
 
-欢迎提 issue。Good luck 😊
+欢迎提 issue。
