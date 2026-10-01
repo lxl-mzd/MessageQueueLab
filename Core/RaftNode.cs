@@ -478,18 +478,23 @@ public sealed class RaftNode : IDisposable
     public async Task StartJoinAndCatchUpAsync(string leaderUrl, MessageQueueHub hub)
     {
         var attempts = 0;
-        while (!_stopping && !_synced && NeedsJoinAtBoot && attempts < 200)
+        while (!_stopping && !_synced && attempts < 200)
         {
             attempts++;
             try
             {
                 // ① join（Leader 侧会走 Quorum；node/url 的成员表同时广播到自己这份节点）
-                var resp = await _http.PostAsJsonAsync($"{leaderUrl}/api/raft/join",
-                    new { node = _nodeId, url = _selfUrl });
-                if (!resp.IsSuccessStatusCode)
+                //   注意：NeedsJoinAtBoot 只在成员表为空时才请求 join；
+                //     若已有成员表但 synced=false（上次 catch-up 未赖完），直接走 catch-up 补发
+                if (NeedsJoinAtBoot)
                 {
-                    await Task.Delay(3000);
-                    continue;
+                    var resp = await _http.PostAsJsonAsync($"{leaderUrl}/api/raft/join",
+                        new { node = _nodeId, url = _selfUrl });
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        await Task.Delay(3000);
+                        continue;
+                    }
                 }
 
                 // ② 拉 Leader 的快照（可能要等 Leader 自己收敛好）
