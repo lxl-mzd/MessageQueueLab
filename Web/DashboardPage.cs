@@ -89,7 +89,7 @@ public static class DashboardPage
 
   <!-- 工具栏 -->
   <div class="toolbar">
-    <span class="mini">节点端口：</span>
+    <span class="mini">节点端口（自动发现，可改）：</span>
     <input id="nodeports" size="14" value="5081,5082,5083">
     <button class="btn btn-blue"   onclick="refresh()">🔄 全体刷新</button>
     <button class="btn btn-slate"  id="tbtn" onclick="toggleAuto()">⏸ 自动刷新 (开)</button>
@@ -146,8 +146,31 @@ function toggleAuto(){ autoOn=!autoOn; document.getElementById("tbtn").textConte
 async function jget(base, path){ try { const r = await fetch(base+path); return { code:r.status, body:await r.text() }; } catch(e){ return { code:0, body:"" }; } }
 
 /* ── 集群汇总 + 每个节点卡片 ── */
+// 端口惯例：mq-N → 5081+N；node-N → 5080+N（node-1=5081 …）。
+// 每次刷新先从本节点 /api/raft/members 拿成员名单自动发现端口；
+// 新加入的节点自动出现，已删除的不再显示。拿不到名单时回退到手动输入框。
+function portFor(name, idx){
+  const m = (name||"").match(/(\d+)\s*$/);
+  if (m){
+    const n = parseInt(m[1], 10);
+    if (/^mq-/i.test(name)) return String(5081 + n);
+    return String(5080 + n);
+  }
+  return String(5081 + idx);
+}
 async function refresh(){
-  const ports = NODES();
+  let ports = NODES();
+  try {
+    const mr = await jget("", "/api/raft/members");
+    if (mr.code === 200){
+      const mj = JSON.parse(mr.body);
+      const names = (mj.table || mj.members || []).map(x => x.node || x.Node || x.name).filter(Boolean);
+      if (names.length){
+        ports = names.map((nm, i) => portFor(nm, i));
+        document.getElementById("nodeports").value = ports.join(",");
+      }
+    }
+  } catch(e){}
     const rows = await Promise.all(ports.map(async p => {
       const b = "http://"+location.hostname+":"+p;
       let [health, raft, queues] = await Promise.all([

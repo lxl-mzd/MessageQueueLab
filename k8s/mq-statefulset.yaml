@@ -21,6 +21,11 @@ spec:
   podManagementPolicy: Parallel
   serviceName: mq-headless
   replicas: 3
+  # 缩容/删除时自动回收 PVC：防止僵尸成员表复活导致脑裂
+  # （wal-mq-3 被删后，下次扩容拿到干净卷 → 走 join-on-boot 干净加入）
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Delete
   selector:
     matchLabels:
       app: mqlab
