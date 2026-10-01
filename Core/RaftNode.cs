@@ -495,6 +495,29 @@ public sealed class RaftNode : IDisposable
                         await Task.Delay(3000);
                         continue;
                     }
+                    // join 已提交：若本地表仍空（apply-membership 广播在途中丢失），
+                    // 主动拉一次成员表本地 apply。只在表空时做、自增 seq 从 1 起，
+                    // 不会挡掉后续真广播（真广播 seq ≥ 2）。
+                    if (MemberCount == 0)
+                    {
+                        try
+                        {
+                            var memBody = await _http.GetStringAsync($"{leaderUrl}/api/raft/members");
+                            using var memDoc = System.Text.Json.JsonDocument.Parse(memBody);
+                            if (memDoc.RootElement.TryGetProperty("table", out var tabArr))
+                            {
+                                var table = new List<Persistence.RaftMember>();
+                                foreach (var m in tabArr.EnumerateArray())
+                                {
+                                    var mn = m.TryGetProperty("node", out var nn) ? nn.GetString() ?? "" : "";
+                                    var mu = m.TryGetProperty("url", out var uu) ? uu.GetString() ?? "" : "";
+                                    if (mn.Length > 0 && mu.Length > 0) table.Add(new Persistence.RaftMember(mn, mu));
+                                }
+                                if (table.Count > 0) ApplyMembership(MemberSeq() + 1, table);
+                            }
+                        }
+                        catch { /* 拉表失败就靠广播那条路，下轮重试 */ }
+                    }
                 }
 
                 // ② 拉 Leader 的快照（可能要等 Leader 自己收敛好）
@@ -512,8 +535,13 @@ public sealed class RaftNode : IDisposable
                 // ④ 自身追平转正（在 sync-ack 之前——确保 Leader 全量复制到来时本节点已 ready）
                 MarkSynced(true);
 
-                // ⑤ 通知 Leader 追平完成
-                await _http.PostAsJsonAsync($"{leaderUrl}/api/raft/sync-ack", new { node = _nodeId, synced = true });
+                // ⑤ 通知 Leader 追平完成，随包携带各账本水位（空账本记 -1，保证 delta 从 Seq 0 开始读）：
+                //    Leader 侧 seed 进 per-follower 水位表 → 快照点到 sync-ack 窗口的漏事件走 delta 回放补齐
+                var wms = new Dictionary<string, long>();
+                foreach (var qs in snap.Queues)
+                    wms[qs.Queue] = qs.Events.Count == 0 ? -1 : qs.UptoSeq;
+                await _http.PostAsJsonAsync($"{leaderUrl}/api/raft/sync-ack",
+                    new { node = _nodeId, synced = true, watermarks = wms });
 
                 _emit?.Invoke($"🎉 [raft:{_nodeId}] join + catch-up 完成（成员表 seq={snap.MemberSeq}）—— 正式入列");
                 return;
