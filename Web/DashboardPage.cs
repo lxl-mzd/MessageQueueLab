@@ -171,6 +171,7 @@ function portFor(name, idx){
 }
 async function refresh(){
   let items = NODES().map((p, i) => ({ name:"", port:p }));
+  let discovered = false;
   try {
     const mr = await jget("", "/api/raft/members");
     if (mr.code === 200){
@@ -181,9 +182,21 @@ async function refresh(){
         items = names.map((nm, i) => ({ name:nm, port:portFor(nm, i) }))
                      .filter(x => !seen.has(x.port) && (seen.add(x.port), true));
         document.getElementById("nodeports").value = items.map(x=>x.port).join(",");
+        discovered = true;
       }
     }
   } catch(e){}
+  if (!discovered){
+    // 单机模式（无 raft/members）：回退看自己，而不是死守输入框的 compose 端口
+    try {
+      const self = await jget("", "/health");
+      const p = String(location.port || "");
+      if (self.code === 200 && p){
+        items = [{ name:"", port:p }];
+        document.getElementById("nodeports").value = p;
+      }
+    } catch(e){}
+  }
     const rows = await Promise.all(items.map(async it => {
       const p = it.port, b = "http://"+location.hostname+":"+p;
       let [health, raft, queues] = await Promise.all([
