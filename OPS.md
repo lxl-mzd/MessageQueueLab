@@ -1,252 +1,445 @@
-# 自造消息队列 · 部署与运维手册（OPS.md v6）
+# 消息队列 · 部署运维手册（给第一次接触的人）
 
-> 适用版本：mq-lab v6+（SDK 自动找王 / follower 纯副本 / join 竞态修复 / K8s 常驻）
-> 读者：部署运维 / 值班 / 微服务接入同学
->
-> 相关文档：`README.md`（定位）· `ARCHITECTURE.md`（架构图）· `DESIGN.md`（设计）
-> · `API.md`（接口）· `K8S_SCALE.md`（K8s 扩缩容流程）· `ENV.md`（环境清单）
+> 你不需要懂 Raft、Quorum、WAL 是什么。跟着敲命令就行，
+> 每一步都有"成功长什么样"对照，不一样就是出问题了。
 
 ---
 
-## 0. 三分钟速查
+## 第一部分：部署（别人电脑上啥都没有，从零开始）
+
+### 准备工作：只装一个 Docker
+
+| 电脑 | 装什么 | 去哪下 |
+|---|---|---|
+| Windows / Mac | Docker Desktop（安装时把 Kubernetes 勾上，如果以后想玩 K8s） | https://www.docker.com/products/docker-desktop |
+| Linux 服务器 | Docker Engine | `curl -fsSL https://get.docker.com \| sh` |
+
+装完验证（复制粘贴，看到版本号就是装好了）：
 
 ```bash
-# 单机（有 docker 即起）
-docker run -d --name mq-server -p 5000:8080 -v mqlab-data:/app/data \
-    ghcr.io/lxl-mzd/messagequeue-lab:latest
-curl http://localhost:5000/health
-
-# 三节点 compose（小团队生产形态）
-git clone https://github.com/lxl-mzd/MessageQueueLab.git
-cd MessageQueueLab && docker compose up -d --build
-
-# k8s（StatefulSet 部署）
-kubectl apply -f k8s/mq-headless-svc.yaml
-kubectl apply -f k8s/mq-write-svc.yaml
-kubectl apply -f k8s/mq-statefulset.yaml
-
-# 日常巡检三连
-docker compose ps
-curl http://127.0.0.1:5081/api/raft/status
-curl http://127.0.0.1:5081/api/queues
+docker --version
 ```
+
+**除此之外什么都不用装。** 不用装 .NET，不用下代码，不用配数据库。
 
 ---
 
-## 1. 部署（三种形态）
+### 方式一：单机模式（1 台机器，测试用，5 分钟搞定）
 
-### 1.1 形态抉择
-
-| 形态 | 场景 | 特征 |
-|---|---|---|
-| **单机**（`MQ_ROLE` 省略即单机） | 开发 / 测试 / 业务量小 | 无 Raft，开箱即用 |
-| **docker-compose 三节点** | 正式微服务链路（小团队） | 每节点独立卷，Raft 动态成员 |
-| **K8s StatefulSet**（当前常驻形态） | 需要 `kubectl scale` 扩缩容 | headless + write 双 Service |
-
-单机最低环境：**只要有 Docker**（.NET SDK、代码仓库都不需要，运行时在镜像里），约 400MB 磁盘，一个空闲端口。
-
-### 1.2 单机部署
+**第 1 步：拉起服务**（复制粘贴下面整段，一次回车）：
 
 ```bash
 docker run -d --name mq-server \
-    -p 5000:8080 \
-    -v mqlab-data:/app/data \
-    --restart unless-stopped \
-    ghcr.io/lxl-mzd/messagequeue-lab:latest
+  -p 5000:8080 \
+  -v mq-data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/lxl-mzd/messagequeue-lab:latest
 ```
 
-- 不传 `-e MQ_ROLE` 即单机（代码默认 `single`）。
-- `-v` 数据卷必备：WAL + 死信账本 + 交换机快照 + Raft 成员表全在里面。
+这行命令的意思（不用背，看懂就行）：
+- `docker run -d`：后台起一个容器
+- `-p 5000:8080`：把容器里的 8080 端口映射到你电脑的 5000 端口（后面都用 5000 访问）
+- `-v mq-data:/app/data`：数据存在一个叫 `mq-data` 的卷里。**没有这一行，容器删掉数据就全没了。**
+- `--restart unless-stopped`：电脑重启后自动把消息队列拉起来
 
-### 1.3 docker-compose 三节点
-
-关键环境变量：
-
-| 变量 | 说明 | 配错后果 |
-|---|---|---|
-| `MQ_PEERS` | Raft 全员表（每节点写全，含自身） | 少一个 → 脑裂双王 |
-| `MQ_SELF` | 本节点对外地址 | Leader 自投心跳自降 → 反复重选 |
-| `MQ_NODE_NAME` | 节点名（node-1/2/3） | 仅显示 |
-| `MQ_ROLE` | leader/follower（初始声明） | 只影响首写入口；Raft 定身后以王为准 |
-
-### 1.4 K8s 部署（StatefulSet）
-
-三个关键开关（缺一个就起不来，全部真实踩过）：
-
-1. **headless Service 必须 `publishNotReadyAddresses: true`** —— 否则 follower 全 NotReady 时互相解析不到，永远选不出王。
-2. **`podManagementPolicy: Parallel`** —— 否则 OrderedReady 下第一个 Pod 不 Ready，后面 Pod 永不创建。
-3. **`persistentVolumeClaimRetentionPolicy: whenScaled/whenDeleted: Delete`** —— 否则缩容残留旧 PVC，下次扩容拿到僵尸成员表自立为王（脑裂，见 §5.4）。
-
-镜像：`mq-lab:18`（本地构建 → `ctr import` 进 K8s containerd，`imagePullPolicy: IfNotPresent`）。
-
----
-
-## 2. 客户端接入：只找 Leader（SDK 全自动）
-
-### 2.1 规则（一句话）
-
-```
-读（queues/health/看板/事件流）：任意节点都行。
-收发消息（receive/send/ack/nack/死信处置/publish/bind/建队）：只打 Leader，否则 503。
-    follower 是纯副本：它的锁只活在自己内存，receive 到它手里也销不了账，所以直接拒收。
-```
-
-**不要给所有节点发请求** —— 写只能打一个（王）。
-
-### 2.2 SDK 用法（用户只管 .Send）
-
-```csharp
-var config = new SefMqConfig {
-    // 种子节点表：写 1 个能活着的就行，不需要写全，更不需要随扩容改代码
-    ["bootstrap.servers"] = "http://h1:5081,http://h2:5082,http://h3:5083"
-};
-var producer = new SefMqProducer(config);
-await producer.SendAsync(new SefMqRecord("normal", "k1", "hello"));  // 不用管谁是王
-
-var consumer = new SefMqConsumer(config);
-consumer.Subscribe("normal");
-await consumer.BeginConsume(async (msg, ctx) => { /* 正常返回=自动 Ack */ });
-```
-
-SDK 内部机制（`SefMqClusterClient`）：
-
-| 机制 | 说明 |
-|---|---|
-| 种子轮询 + 503 换王 | 第一次按种子顺序试，503/连不上就换下一个 |
-| 内存缓存 Leader | 打中谁就记住，下次直达，少一次试探 |
-| 成员表自学习 | 每次绕路才找到王，就顺手向王要最新成员表（`/api/raft/members`），新节点 URL 自动并入种子 —— **扩容后 SDK 不用改配置** |
-| 旧配置兼容 | `bootstrap.url` 单地址照样能用 |
-
-### 2.3 K8s 下更省事：直接打 Service 名
-
-```
-http://mq-write:8080/api/q/normal/messages
-```
-
-`mq-write` 的 readiness 探针是 `/api/raft/write-ready`（仅 Leader 200），K8s 自动把流量只导给当王的 Pod。王漂移时 endpoint 自动切换，客户端无感。
-
----
-
-## 3. 日常运维
-
-### 3.1 巡检五项
-
-| 检查项 | 方法 | 健康值 |
-|---|---|---|
-| 探活 | `GET /health` | 200 alive |
-| 王位 | `GET /api/raft/status` × N | 恰好 1 个 Leader；term 一致或 ±1 |
-| 复制同步 | `GET /api/queues` × N | `pendingOnDisk` 差距 ≤10 |
-| 死信 | `deadLetters` | 增长 <10 条/分钟 |
-| 磁盘 | data 卷 | <80% |
-
-看板：`http://<王>:8080/`（单机 `:5000/`）。节点卡**自动发现**：每次刷新先读成员表按 `mq-N→5081+N` / `node-N→5080+N` 算端口，新节点自动出现、删除自动消失；拿不到名单时回退手动输入框。
-
-### 3.2 告警阈值
-
-1. 任一节点 `/health` >30s 无响应 → P1
-2. `leaderId` 30s 内翻转 ≥2 次 → P1（选主抖动）
-3. data 卷 >80% → P0
-4. `deadLetters` >10/分钟 → P2（下游挂了）
-5. `pendingOnDisk` 节点差 >100 → P2（复制积压）
-6. 成员表出现重复 node 名 → P1（脑裂前兆）
-
-### 3.3 运维动作
+**第 2 步：确认跑起来了：**
 
 ```bash
-# 死信复活 / 删除
-curl -X POST http://<王>:8080/api/q/<q>/dlq/<id>/revive     # retryCount 归 0
-curl -X POST http://<王>:8080/api/q/<q>/dlq/<id>/ack
-# 动态建队 / 改绑定（持久化，重启不掉）
-curl -X POST http://<王>:8080/api/q/audit
-curl -X POST "http://<王>:8080/api/ex/dead/bind?pattern=dead.urgent&queue=error"
+curl http://localhost:5000/health
 ```
 
-`🧊 幂等拦截` 日志是正常防护（同 id 幽灵被挡），不是故障。
+成功长这样（status 是 alive 就行）：
+
+```json
+{"service":"self-made-mq","status":"alive","now":"2026-10-01 14:20:57"}
+```
+
+不成功长这样（二选一处理）：
+- `curl: (7) Failed to connect` → 容器没起来，跑 `docker logs mq-server` 看最后一行报错
+- 端口被占用 → 把 `-p 5000:8080` 改成 `-p 5001:8080`，后面所有 `5000` 换成 `5001`
+
+**第 3 步：发第一条消息试试：**
+
+```bash
+curl -X POST http://localhost:5000/api/q/test/messages \
+  -H "Content-Type: application/json" \
+  -d '{"content":"hello"}'
+
+curl -X POST http://localhost:5000/api/q/test/receive
+```
+
+第二条命令返回了 `hello`，单机部署成功。
 
 ---
 
-## 4. 扩容 / 缩容
+### 方式二：compose 三节点模式（生产用，10 分钟搞定）
 
-### 4.1 docker-compose 加节点（手动一步）
+**第 1 步：拿代码**（只需要里面的 `docker-compose.yml`）：
+
+```bash
+git clone https://github.com/lxl-mzd/MessageQueueLab.git
+cd MessageQueueLab
+```
+
+没装 git？去 https://git-scm.com/downloads 下一个，一路下一步。
+
+**第 2 步：拉起三个节点：**
+
+```bash
+docker compose up -d --build
+```
+
+**第 3 步：确认三个都活着，且只选出一个王：**
+
+```bash
+docker compose ps
+```
+
+成功长这样（三个都是 Up）：
+
+```
+messagequeuelab-node-1-1  Up
+messagequeuelab-node-2-1  Up
+messagequeuelab-node-3-1  Up
+```
+
+再确认选主（三条命令，每条看 `role` 字段）：
+
+```bash
+curl http://127.0.0.1:5081/api/raft/status
+curl http://127.0.0.1:5082/api/raft/status
+curl http://127.0.0.1:5083/api/raft/status
+```
+
+成功标准：**三条返回里，恰好一个 `"role":"Leader"`，另外两个是 `"role":"Follower"`**，而且三个的 `term` 数字一样。
+
+- 0 个 Leader → 还在选，等 30 秒再查
+- 2 个 Leader → 脑裂，停掉重来（见第五部分）
+
+**第 4 步：发一条消息试试（打给王，5081/5082/5083 哪个是王就打哪个）：**
+
+```bash
+curl -X POST http://127.0.0.1:5082/api/q/normal/messages \
+  -H "Content-Type: application/json" \
+  -d '{"content":"cluster-hello"}'
+```
+
+成功返回里有 `"ackCount":3`（三个节点都落盘了）。
+
+打错门（打到 follower）会返回 `503` —— 不是故障，换一个端口再打就行。嫌麻烦就用 SDK（它自动找王，见 API.md）。
+
+---
+
+### 方式三：K8s 模式（要扩缩容才用，20 分钟搞定）
+
+**第 0 步：确认 Docker Desktop 里 Kubernetes 开着。**
+打开 Docker Desktop → 右下角 Settings → Kubernetes → 勾选 "Enable Kubernetes" → Apply。第一次开要下载几分钟，右下角鲸鱼图标不再转圈就是好了。验证：
+
+```bash
+kubectl get nodes
+```
+
+成功长这样：
+
+```
+NAME                    STATUS   ROLES           AGE   VERSION
+desktop-control-plane   Ready    control-plane   ...   v1.36.1
+```
+
+**第 1 步：部署三个文件（顺序别反）：**
+
+```bash
+kubectl apply -f k8s/mq-headless-svc.yaml
+kubectl apply -f k8s/mq-write-svc.yaml
+kubectl apply -f k8s/mq-statefulset.yaml
+```
+
+这三个是干嘛的（一句话版）：
+- `mq-headless-svc`：给每个 Pod 一个固定名字（mq-0/mq-1/mq-2），互相能找到
+- `mq-write-svc`：只把流量导给王（自动跟王走，王换了它自己换）
+- `mq-statefulset`：管三个 Pod + 每人一块独立磁盘
+
+**第 2 步：等 Pod 都起来：**
+
+```bash
+kubectl get pods
+```
+
+成功长这样（1/1 的是王，0/1 的是跟随者——**跟随者 0/1 是正常的**，只有王才标 Ready）：
+
+```
+mq-0   0/1     Running
+mq-1   0/1     Running
+mq-2   1/1     Running
+```
+
+如果有 Pod 一直 `Pending`：磁盘 storageclass 有问题，Docker Desktop 默认一般没事，重启 Docker Desktop 再试。
+
+**第 3 步：验证能写：**
+
+```bash
+# 先搭一座桥（K8s 里面，外面够不着，搭桥才能访问；这个窗口关了桥就断）
+kubectl port-forward svc/mq-write 5091:8080 --address 0.0.0.0
+
+# 新开一个终端验证
+curl -X POST http://127.0.0.1:5091/api/q/normal/messages \
+  -H "Content-Type: application/json" \
+  -d '{"content":"k8s-hello"}'
+```
+
+返回 `"ackCount":3` 就是成功。
+
+---
+
+## 第二部分：运维就是看监控面板
+
+### 2.0 先搭桥（K8s 专用，compose/单机跳过）
+
+K8s 里面的服务，外面浏览器够不着，需要搭两座桥（两个命令，各开一个终端挂着，**关了就进不去**）：
+
+```bash
+# 桥 1：看板入口（开 http://127.0.0.1:5091/ 看）
+kubectl port-forward svc/mq-write 5091:8080 --address 0.0.0.0
+
+# 桥 2~4：三个节点逐台详情（看板自动发现要用）
+kubectl port-forward pod/mq-0 5081:8080 --address 0.0.0.0
+kubectl port-forward pod/mq-1 5082:8080 --address 0.0.0.0
+kubectl port-forward pod/mq-2 5083:8080 --address 0.0.0.0
+```
+
+compose / 单机不需要搭桥：单机直接 `http://localhost:5000/`，compose 直接 `http://127.0.0.1:5081/`。
+
+### 2.1 打开看板
+
+| 模式 | 地址 |
+|---|---|
+| 单机 | http://localhost:5000/ |
+| compose | http://127.0.0.1:5081/（三个端口任意一个都行） |
+| K8s | http://127.0.0.1:5091/（先搭上面的桥） |
+
+### 2.2 每个数字是什么意思（正常长什么样）
+
+看板从上到下分四块：
+
+**第一排：五个大数字（全集群总数）**
+
+| 数字 | 意思（大白话） | 正常值 | 不正常 |
+|---|---|---|---|
+| 全集群就绪 | 等着被领走的消息数 | 时有时无，来活就涨，消费完就掉 | 一直涨不掉 → 消费者挂了 |
+| 全集群锁定区 | 被领走、还没 ack 的消息数 | 小数字，来回波动 | 一直涨 → 消费者领了不认账 |
+| 全集群主账 | 磁盘上有多少条没销账 | 和"就绪+锁定"差不多 | 差很多 → 问开发 |
+| 全集群死信 | 失败太多次、等人工看的消息数 | 0，最好一直是 0 | 一直涨 → 下游业务逻辑坏了 |
+| 存活节点 | 格式是 `在线数/总数`，后面跟王的状态 | `3/3 在线 · Leader unique` |  anything else → 看下面 |
+
+**第二块：服务器节点（每台一张卡）**
+
+每张卡四要素：
+- 左上角名字（mq-0 / node-1）和地址
+- 右上角徽章：`Leader`（绿，王）/ `Follower`（灰，跟随者）/ `Down`（红，失联）
+- `term=数字 leader=名字`：三张卡的 term 必须一样；leader 必须是同一台
+- 四个小数字：这台机器自己的就绪/锁定/主账/死信
+
+每张卡三个按钮：
+- `健康检查`：弹窗显示这台机器 raw 状态，看不懂就截图发开发
+- `事件流`：这台机器最近干了什么（谁选上王、谁复制了、谁压缩了）
+- `冒烟测试`：在这台机器上走一遍"写→读→删"，通了就弹 OK
+
+**第三块：队列明细 / 交换机 / 死信货架**
+
+- 队列明细：每个队列的四个数，同第一排
+- 交换机：路由规则表，不用动，除非你要改路由（先看懂再改）
+- 死信货架：每条死信两个按钮——`复活`（送回队列重发一次）、`销账`（看过确认没问题，删掉）
+
+**第四块：事件流水**
+
+所有节点最近干的事按时间排。找关键词：
+- `当选 Leader` → 刚选完王（后面应安静）
+- `Quorum 未达` → 写失败了，看前后发生了什么
+- `压缩完成` → 磁盘 GC，正常
+- `幂等拦截` → 挡掉重复消息，正常
+
+### 2.3 CPU 内存怎么看（看板上没有，用这两条命令）
+
+看板只显示**消息队列自己的指标**，CPU/内存要看容器层面：
+
+**compose / 单机：**
+
+```bash
+docker stats
+```
+
+出来一张实时表，只看两列：
+- `CPU %`：长期 >80% → 机器扛不住了 → 去第 3 部分扩容
+- `MEM %`：长期 >80% → 同上
+
+**K8s：**
+
+```bash
+kubectl top pods
+```
+
+没有这条命令？先装 metrics-server（Docker Desktop 一般自带，空就跳过，用 `docker stats` 看宿主机也行）：
+- 某个 mq Pod 的 CPU 一直顶满 → 去第 3 部分扩容
+
+**先分清再动手**：如果 CPU/内存不高，但是"全集群就绪"一直涨——那不是机器小，是**消费者太慢**，加消费者，不加消息队列节点。
+
+---
+
+## 第三部分：扩缩容（什么时候扩 + 怎么扩 + 怎么缩）
+
+### 3.0 什么时候需要扩
+
+三个信号，**中一个就考虑扩**：
+
+1. `docker stats` / `kubectl top pods` 里 CPU 或内存长期 >80%
+2. 看板"全集群就绪"只涨不掉，加消费者也追不上（写远大于读）
+3. `pendingOnDisk` 三节点差距 >100 且长时间不追平（复制跟不上了）
+
+都不中？别扩，扩了浪费。
+
+### 3.1 compose 加节点（手动两步）
+
+以 3 台加到第 4 台为例（端口按 5081 往后递增，第 4 台用 5084）：
+
+**第 1 步：起容器**（复制粘贴，把 `node-4` / `5084` 换成你要的）：
 
 ```bash
 docker run -d --name node-4 --network messagequeuelab_default -p 5084:8080 \
   -e MQ_NODE_NAME=node-4 -e MQ_SELF=http://node-4:8080 -e MQ_PEERS= \
   -e MQ_ROLE=leader -e MQ_LEADER_URL=http://node-1:8080 mq-lab:18
-# 全自动：join → 成员表广播 → catch-up 快照 → sync-ack → 入列
 ```
 
-### 4.2 K8s 扩缩容（一行命令）
+**第 2 步：等 1 分钟，看它自己入列。** 新节点会自动：报到 → 拿成员表 → 从王那里把历史数据补齐 → 开始干活。你要做的只是等，然后验证：
 
 ```bash
-kubectl scale statefulset mq --replicas=4   # 新 Pod 自动 join+追平
-kubectl scale statefulset mq --replicas=3   # SIGTERM → 优雅下线 → 成员表自动去掉
+curl http://127.0.0.1:5084/api/raft/status
 ```
 
-扩容时新节点三闸门（未追平前）：不竞选、不投票、write-ready 503。追平后自动转正。
+成功标志（三个同时满足）：
+- `"synced":true`
+- `"memberCount":4`
+- `members` 里有 4 个名字
 
-缩容时被杀节点：SIGTERM → `GracefulOfflineAsync`（Follower 向王发 leave；是王就自己走 leave 并轮询确认新王）→ 退出。剩余节点 Quorum 自动收缩（4→3 票）。
+再去看板刷新，应该自动多出一张 `node-4` 的卡（看板会自动发现新节点，不用改配置）。
 
-### 4.3 票数数学
+### 3.2 compose 减节点
 
-| 规模 | 写 Quorum（ack 数） |
-|---|---|
-| 3 节点 | 2 |
-| 4 节点 | 3 |
-| 5 节点 | 3 |
+```bash
+docker stop node-4
+```
 
-公式 `floor(N/2)+1`，N = 已同步成员数（Syncing 中不计票）。
+就这一条。它收到停止信号会自己先跟王说"我走了"（优雅下线），王把成员表改回 3 个。等 15 秒验证：
+
+```bash
+curl http://127.0.0.1:5081/api/raft/status
+# memberCount 回到 3
+```
+
+**删容器不删数据**：`docker rm node-4` 只删容器，它的卷还在；想连数据一起扔才加 `--volumes`（一般别加）。
+
+### 3.3 K8s 扩缩容（一行命令）
+
+```bash
+kubectl scale statefulset mq --replicas=4   # 扩到 4
+kubectl scale statefulset mq --replicas=3   # 缩回 3
+```
+
+**扩容后等 1~2 分钟再验证**（Pod 启动 + 自动 join + 补数据需要时间）：
+
+```bash
+kubectl get pods          # 4 个 Running（只有王是 1/1 Ready，跟随者 0/1 是正常的）
+```
+
+**缩容是全自动优雅下线**：StatefulSet 先杀序号最大的 Pod → Pod 收到 SIGTERM → 自己向王发 leave → 王改成员表 → Pod 再退出。验证成员表：
+
+```bash
+# 随便找个 Pod 的转发端口查（接上面的桥，用 5091 经 mq-write 问王）
+curl http://127.0.0.1:5091/api/raft/members
+```
+
+**注意**：缩容后旧 Pod 的磁盘卷会被自动回收（这是故意配的，防僵尸数据复活脑裂）。**缩容前确认**：`pendingOnDisk` 三节点基本一致（数据已同步完），再缩。
+
+### 3.4 扩完怎么确认真的好了（三步）
+
+```bash
+# 1. 成员数对了（扩到几就是几）
+curl http://127.0.0.1:5091/api/raft/members
+
+# 2. 写一条，ack 数 == 成员数（4 节点就是 ack=4）
+curl -X POST http://127.0.0.1:5091/api/q/normal/messages \
+  -H "Content-Type: application/json" -d '{"content":"smoke"}'
+
+# 3. 看板刷新，新卡出现且数字正常
+```
 
 ---
 
-## 5. 故障排查速查表
+## 第四部分：备份、恢复、升级（各就三条命令）
 
-| 症状 | 最可能原因 | 处理 |
+### 备份（每周至少一次，拷走就行）
+
+```bash
+docker run --rm -v mqlab-leader:/data -v $PWD/backup:/backup alpine \
+  tar czf /backup/mqlab-$(date +%F).tar.gz -C /data .
+```
+
+K8s 的卷名用 `kubectl get pvc` 查，`v` 后面换成对的卷名，命令一样。
+
+### 恢复
+
+```bash
+mkdir -p $PWD/data
+tar xzf mqlab-2026-09-24.tar.gz -C $PWD/data
+docker run -d -p 5000:8080 -v $PWD/data:/app/data \
+  -e MQ_ROLE=single ghcr.io/lxl-mzd/messagequeue-lab:latest
+```
+
+起来后看日志有"磁盘认领"字样就是认回来了。
+
+### 升级（不停服四步）
+
+1. 先升跟随者：一次升一台，升完等它 Ready 再升下一台
+2. 最后升王：停王 → 起新版 → 剩下两台 10 秒内自动选出新王
+3. 每步后写一条消息验证 `ack` 数 == 当前成员数
+4. 全程业务方无感（SDK 自动找新王；裸调的遇到 503 重试一次就行）
+
+**铁律**：`docker compose down` **永远不带 `--volumes`**（带了就是删账本）。K8s 升级改 image tag 后 `kubectl rollout restart statefulset/mq`。
+
+### 回滚
+
+GHCR 里每个版本都带 git 短哈希 tag，打回旧版只需把镜像 tag 改回去重起：
+
+```bash
+docker pull ghcr.io/lxl-mzd/messagequeue-lab:<旧的sha>
+```
+
+---
+
+## 第五部分：出问题先查这张表
+
+| 你看到的现象 | 最可能的原因 | 复制粘贴这条命令看一眼 |
 |---|---|---|
-| 全节点写 503 | 选不出王 | 查 `MQ_PEERS` / 网络；等 30~60s 收敛 |
-| 发现 2 个 Leader | 脑裂 | 查成员表是否一致；重点查**僵尸 PVC**（§5.4） |
-| 新节点 `synced=false` 卡死 | catch-up 拉不到快照 / join 打到非王节点 | 查 Leader 是否存活；`MQ_LEADER_URL` 指向王（K8s 用 mq-write Service 名） |
-| 新节点 `memberCount=0` 但 join 显示成功 | join 广播竞态（已修）：发 join 时自身 HTTP 未监听 | 先确认镜像 ≥ 最新 tag；再查该节点 `/api/raft/members` 是否持久化 |
-| 写 503 但 raft 有王 | 请求打到了非王节点 | 用 SDK 或 mq-write Service；裸调时先查王再打 |
-| 三节点 `pendingOnDisk` 不一致 | follower 掉线，delta replay 没跟上 | `/api/raft/members` 查 synced；查网络连通 |
-| 大量 `🧊 幂等拦截` | 客户端重复投递 | 正常防护日志，不是故障 |
-| 同一节点日志每秒重复一行 | 服务起了双进程抢端口 | 杀掉重复进程 / 查端口占用 |
-| `☠️ DLX dead` 频繁 | 业务消息反复 nack | 下游处理坏了，看死信清单 |
-
-### 5.4 经典故障：僵尸成员表脑裂（已修，留档）
-
-**现象**：缩容后再次扩容，新 Pod 自立为王（term 更大），与主集群分裂。
-
-**根因**：StatefulSet 缩容不删 PVC → 新 Pod 挂回旧卷 → 读到几个月前的 `members.json`（含自己）→ 以为自己是合法成员开始竞选。
-
-**修复**：`persistentVolumeClaimRetentionPolicy: whenScaled/whenDeleted: Delete`。缩容自动清卷，下次扩容拿干净卷走 join 流程。
+| 看板全 Down / 0/3 在线 | 看板问错了地址（端口转发没建，或 compose 关了） | 先 `curl` 一下对应端口的 `/health`，通不通 |
+| 写返回 503 | 打到跟随者了（只有王能写） | 换个端口打，或用 SDK / mq-write Service |
+| `memberCount` 三台不一致 | 有节点刚加/刚走，成员表还没收敛 | 等 1 分钟再查；还不一致就重启那个数的节点 |
+| 新节点 `synced=false` 卡死 | join 打到非王节点，或快照拉不到 | 查它的 `MQ_LEADER_URL` 是否指向王；看它的容器日志 |
+| 出现 2 个 Leader | 脑裂：旧数据卷复活（僵尸成员表） | 删掉问题 Pod 的卷重建（K8s 已配自动回收，compose 手动 `volume rm`） |
+| `pendingOnDisk` 差 >100 | follower 掉线，delta replay 没跟上 | 查该节点连通性；巡查员每秒自动补，看事件流有没有 `delta-replay` |
+| 死信一直涨 | 下游业务挂了 | 先看死信内容，再修下游；急着恢复先点复活 |
+| 磁盘 >80% | WAL 涨太快，压缩跟不上 | 看事件流有没有 `压缩完成`；没有就加磁盘，消息太多就扩节点 |
+| K8s Pod 一直 0/1 | 它是 follower（只有王 Ready，**正常的**） | 看 `role` 是不是 Follower，是就不用管 |
+| K8s Pod 一直 Pending | 磁盘 storageclass 问题 | 重启 Docker Desktop 再试 |
 
 ---
 
-## 6. 备份 / 恢复 / 升级 / CI
-
-- **备份**：每天 tar 任一节点的 data 卷（WAL + `_cluster/members.json` + `_exchanges.json` 全在里面）。
-- **恢复**：空目录解压 → 起单机（目录认领）或重建集群（成员表回放）。
-- **升级**：先 follower 后王；`compose down` **永不带 `--volumes`**；K8s 改 image tag 后 `rollout restart`。
-- **回滚**：GHCR 按 sha 取旧镜像（`ghcr.io/lxl-mzd/messagequeue-lab:<sha>`）。
-- **CI**：push/PR → build + 24 单测 + 三节点 e2e（选主/Quorum/DLX/杀王）；main 合入 → 推 GHCR `latest` + `sha`。
-
-## 7. 已知限制（诚实清单）
-
-1. SDK 种子全灭则不可用（至少 1 个活种子是底线；K8s 下建议种子写 Service 名）。
-2. 元数据（`_exchanges.json` 绑定表）各节点各自持久化，改绑定要在王节点改。
-3. 无鉴权：生产放内网或前置反向代理做 API-Key。
-4. 大 WAL 快照传输是全量（百万级消息的首次 join 会慢；后续 delta 只追增量）。
-
----
-
-## 一句话总结
+## 一句话总结（贴显示器上）
 
 ```
 部署：单机 1 条命令；compose 1 条命令；K8s 3 个 yaml。
-扩缩：compose 手动一步；K8s 一行 scale，join/catch-up/leave 全自动。
-客户端：种子给 1 个活地址就行，找王+自学习 SDK 包了。
-值班：看 3.1 五项 + 3.2 六阈值；出事先看 §5 表。
+看病：先看汇总五个大数字，再看每台卡的徽章（绿王/灰跟随/红失联）。
+加人：compose 复制粘贴起容器；K8s 一行 scale。等 1 分钟，看成员数。
+减人：compose docker stop；K8s 一行 scale。等 15 秒，看成员数。
+备份：每周 tar 一个卷。升级：先跟随者后王。down 永不带 --volumes。
 ```
 
-欢迎提 issue。
+有问题先看第五部分的表，表里没有再提 issue。
