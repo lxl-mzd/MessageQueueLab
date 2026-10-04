@@ -287,22 +287,18 @@ kubectl top pods
 
 ## 第三部分：扩缩容（什么时候扩 + 怎么扩 + 怎么缩）
 
-### 3.0 什么时候需要扩（只看成员健康，不看资源水位）
+### 3.0 看到什么 → 做什么（只看成员健康，不看资源水位）
 
-先记住定位：我们是微服务之间的通信中间件，吞吐量要求不高；follower 不接客户端流量，加节点分担不了压力。扩缩容唯一目的：**保住 quorum**（3 节点死 2 个就写瘫）。
+先记住一句：follower 不接流量，加节点分担不了压力；扩缩容唯一目的就是**保住 3 个活人**。CPU/内存/磁盘高 → 那是"查因"不是"加人"（CPU 飙查选举风暴或消费堆积；内存涨重启该节点；磁盘涨扩卷，加节点反而更糟）。
 
-两个信号，**中一个就补节点**：
+| 你在看板上看到 | 这是什么情况 | 你要做的事 |
+|---|---|---|
+| 3/3 在线，有王 | 一切正常 | 什么都不做 |
+| 2/3 在线，有王 | 死 1 个，quorum 还在 | 按 3.1（compose）或 3.3（K8s）补 1 个；新节点 `synced=true` 才算补上 |
+| 1/3 在线，有王 | 光杆司令：王还在位但写全 503 | 先等 10 分钟（重启/网络抖动会自己回来）；等不回来 → 去 3.5。**别加节点**，没人处理 join，加了也进不来 |
+| 没王（Leader missing） | quorum 没了 | 直接去 3.5，**别加节点** |
 
-1. 看板存活数 < 3（有节点失联 / `synced=false` 超过 10 分钟没自己回来）
-2. `memberCount` 长期 < 3（优雅下线后没补回来）
-
-都不中？别扩，扩了浪费。CPU/内存/磁盘高 → 那是"查因"不是"加人"：
-
-- CPU 飙 → 查选举风暴（事件流搜 `当选 Leader`）或消费堆积
-- 内存涨 → 泄漏或快照堆积，重启该节点（盘里数据不丢）
-- 磁盘涨 → 所有节点全量存数据，加节点反而更糟（新节点要全量复制）；看压缩事件，不行就扩磁盘卷
-
-**严禁**：给 StatefulSet 配 CPU/内存 HPA 自动扩缩。自动加减 Pod = 成员表来回 churn，每次都是一次 leave+join+选举。F1/F2 能自愈，但别主动找事。
+**严禁**：给 StatefulSet 配 CPU/内存 HPA 自动扩缩。自动加减 Pod = 成员表来回 churn，每次都是一次 leave+join+选举。
 
 ### 3.1 compose 加节点（手动两步）
 
@@ -381,6 +377,61 @@ curl -X POST http://127.0.0.1:5091/api/q/normal/messages \
 # 3. 看板刷新，新卡出现且数字正常
 ```
 
+### 3.5 灾难恢复（只剩 1 个或没王时才进这里）
+
+症状对上 3.0 表格最后两行才进这里。核心就一句话：**剩的人凑不够票，任何自动手段都没用，只能手动把幸存者扶成单人种子，再把别人重新加进来**。数据靠 WAL 回放回来，不丢（前提是幸存者的盘还在）。
+
+**compose 版**（假设幸存者是 `node-1`，不是就把名字和卷名换掉；全程别 `compose down`，网络要留着）：
+
+```bash
+# 1. 确保死的透透的，别中途诈尸
+docker stop node-2 node-3
+docker stop node-1
+
+# 2. 删掉 node-1 的旧成员表（让它按启动参数重新认人）
+docker run --rm -v mqlab-leader:/d busybox rm -f /d/_cluster/members.json
+
+# 3. node-1 单人种子重启（全员表只写自己，join 目标留空）
+docker rm node-1
+docker run -d --name node-1 --network messagequeuelab_default -p 5081:8080 \
+  -e MQ_NODE_NAME=node-1 -e MQ_SELF=http://node-1:8080 -e MQ_PEERS=http://node-1:8080 \
+  -e MQ_LEADER_URL= -v mqlab-leader:/app/data mq-lab:22
+
+# 4. 等 30 秒，看它自己称王（role 应为 Leader，memberCount 应为 1）
+curl http://127.0.0.1:5081/api/raft/status
+```
+
+```bash
+# 5. node-2、node-3 清盘当新节点加回来（和加 node-4 一个套路）
+docker rm node-2 node-3
+docker volume rm mqlab-follower-1 mqlab-follower-2
+docker run -d --name node-2 --network messagequeuelab_default -p 5082:8080 \
+  -e MQ_NODE_NAME=node-2 -e MQ_SELF=http://node-2:8080 -e MQ_PEERS= \
+  -e MQ_LEADER_URL=http://node-1:8080 -v mqlab-follower-1:/app/data mq-lab:22
+docker run -d --name node-3 --network messagequeuelab_default -p 5083:8080 \
+  -e MQ_NODE_NAME=node-3 -e MQ_SELF=http://node-3:8080 -e MQ_PEERS= \
+  -e MQ_LEADER_URL=http://node-1:8080 -v mqlab-follower-2:/app/data mq-lab:22
+
+# 6. 等 2 分钟验证：memberCount 回到 3，写一条 ack=3，老数据能读出来
+```
+
+**K8s 版**（对号入座）：
+
+- **死的 Pod 卷还在**（`kubectl get pvc` 还能看到）：那不叫灾难。`kubectl delete pod <死掉的名字>` 等它重启归队（超过 2 分钟 `synced` 还 false 就再删一次）。两次不回来再往下走。
+- **卷没了 / 全灭**：用备份 tar 把**同一份**数据灌进 3 个 Pod（必须一模一样，不一样开机就是三套账）：
+```bash
+# 1. 先把空集群跑起来（起来后别写！）
+kubectl scale statefulset mq --replicas=3
+# 2. 同一份备份灌进 3 个 Pod（文件名换成你的备份，3 个逐个灌）
+kubectl cp ./backup/mqlab-2026-09-24.tar.gz mq-0:/tmp/restore.tgz
+kubectl exec mq-0 -- tar xzf /tmp/restore.tgz -C /app/data
+# ... mq-1、mq-2 重复上面两条 ...
+# 3. 删掉 3 个 Pod 让它们回放重启
+kubectl delete pod mq-0 mq-1 mq-2
+# 4. 等 2 分钟验证：3/3 在线、写一条 ack=3、老数据能读出来
+```
+- **没备份？**：删卷重建空集群，数据认丢——这就是每周备份的原因。
+
 ---
 
 ## 第四部分：备份、恢复、升级（各就三条命令）
@@ -440,6 +491,8 @@ docker pull ghcr.io/lxl-mzd/messagequeue-lab:<旧的sha>
 | 磁盘 >80% | WAL 涨太快，压缩跟不上 | 看事件流有没有 `压缩完成`；加节点没用（新节点要全量复制，更糟），扩磁盘卷或清过期数据 |
 | K8s Pod 一直 0/1 | 它是 follower（只有王 Ready，**正常的**） | 看 `role` 是不是 Follower，是就不用管 |
 | K8s Pod 一直 Pending | 磁盘 storageclass 问题 | 重启 Docker Desktop 再试 |
+| 1/3 在线但写全 503 | 光杆司令：王还在位，臣子没了 | 等 10 分钟；等不回来去 3.5，**别加节点** |
+| 没王（Leader missing）| quorum 丢了 | 直接去 3.5，**别加节点** |
 
 ---
 
@@ -450,6 +503,7 @@ docker pull ghcr.io/lxl-mzd/messagequeue-lab:<旧的sha>
 看病：先看汇总五个大数字，再看每台卡的徽章（绿王/灰跟随/红失联）。
 加人：compose 复制粘贴起容器；K8s 一行 scale。等 1 分钟，看成员数。
 减人：compose docker stop；K8s 一行 scale。等 15 秒，看成员数。
+灾难：先看有没有王；没王或只剩 1 个 → 去 3.5，别加节点。
 备份：每周 tar 一个卷。升级：先跟随者后王。down 永不带 --volumes。
 ```
 
