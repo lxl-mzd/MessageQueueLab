@@ -167,6 +167,262 @@ flowchart TB
 - `Web` 无状态：所有判断问 `Hub` / `RaftNode` / `ClusterOptions`，自己不记账。
 - `Sdk` 只依赖 HTTP：与服务端版本解耦，换语言重写也行。
 
+## 3.5 类图（完整：仅列关键公开成员，`$` = 静态）
+
+```mermaid
+classDiagram
+    namespace Core {
+        class ClusterOptions {
+            +NodeName$ : string
+            +SelfUrl$ : string
+            +Peers$ : string[]
+            +LeaderUrl$ : string
+            +Distributed$ : bool
+            +IsWriter$ : bool
+            +Raft$ : RaftNode
+        }
+        class RaftNode {
+            +Role : RaftRole
+            +Synced : bool
+            +WriteReady : bool
+            +StartAsync() Task
+            +HandleVote(candidate, term) RaftVoteResponse
+            +ReceiveHeartbeat(leader, term) void
+            +JoinMemberAsync(node, url) Task
+            +LeaveMemberAsync(node) Task
+            +ApplyMembership(seq, table) void
+            +MarkSynced(v) void
+            +TryRejoinAtBootAsync(url, hub) Task
+            +GracefulOfflineAsync() Task
+            +PublishTargets() string[]
+            +WriteMajority() int
+        }
+        class MessageQueueHub {
+            +DeclareQueue(name) QueueCore
+            +Publish(exchange, key, content) int
+            +Bind(exchange, pattern, queue) void
+            +CaptureSnapshot() ClusterSnapshotBody
+            +ApplySnapshot(snap) void
+            +ReplicateQueueEventAsync(q, evt) Task
+            +ReplayDeltaToFollowerAsync(url) Task
+            +SweepAll() int
+            +PushEvent(msg) void
+        }
+        class QueueCore {
+            +Send(content, key, ttl) MqMessage
+            +CommitEvent(evt) void
+            +CommitAck(evt) void
+            +PushExternal(evt) void
+            +RestoreFromSnapshot(items, upto) void
+            +Stats() QueueCoreStats
+        }
+        class ClusterReplicator {
+            +ReplicateAsync(queue, evt) Task
+            +SeedWatermark(follower, queue, seq) void
+            +IsLagging(follower) bool
+        }
+        class RaftVoteResponse {
+            +Term : long
+            +VoteGranted : bool
+        }
+        class ReplicationResult {
+            +AckCount : int
+            +Required : int
+            +AckedBy : string[]
+        }
+        class ClusterSnapshotBody {
+            +MemberSeq : long
+            +Queues : Snapshot[]
+        }
+        class RaftRole {
+            <<enumeration>>
+            Follower
+            Candidate
+            Leader
+        }
+    }
+    namespace Persistence {
+        class Log {
+            +BuildEvent(type, msg, id) LogMessage
+            +CommitEvent(evt) void
+            +PushExternal(evt) void
+            +Replay() void
+            +Snapshot() Message[]
+            +ReadEventsFromSeq(seq) Message[]
+            +LoadSnapshot(items, upto) void
+        }
+        class LogSegment {
+            +Append(evt) void
+            +ReadAll() Message[]
+            +MarkSealed() void
+            +RewriteInPlace(kept) void
+        }
+        class LogMessage {
+            +Seq : long
+            +Ledger : string
+            +Type : string
+            +Message : MqMessage
+            +EncodeLine() string
+            +TryDecodeLine(line)$ bool
+        }
+        class LogCleaner {
+            +Compact(dir, log)$ void
+        }
+        class MessageRegistry {
+            +MarkReady(queue, seg, line, msg)$ void
+            +MarkInFlight(queue, seg, line, msg)$ void
+            +MarkAcked(queue, id)$ void
+            +MarkDead(queue, seg, line, msg)$ void
+            +TryGet(queue, id)$ Entry
+            +EvictStale()$ void
+        }
+        class RegistryEntry {
+            +State : RegistryState
+            +Segment : LogSegment
+            +LineNo : int
+        }
+        class RegistryState {
+            <<enumeration>>
+            Ready
+            InFlight
+            Acked
+            Dead
+        }
+        class MembershipStore {
+            +Table : RaftMember[]
+            +Seed(bootstrap) void
+            +Contains(node) bool
+            +Apply(seq, table) void
+            +NextSeq() long
+        }
+        class RaftMember {
+            +Node : string
+            +Url : string
+        }
+        class SegmentState {
+            <<enumeration>>
+            Active
+            Sealed
+            Compacted
+        }
+    }
+    namespace Domain {
+        class Binding {
+            +Pattern : string
+            +Queue : string
+            +Matches(routingKey) bool
+        }
+        class ExchangeDef {
+            +Name : string
+            +Type : string
+            +Bindings : Binding[]
+        }
+        class MqMessage {
+            +Id : string
+            +Crc : string
+            +Key : string
+            +Content : string
+            +RetryCount : int
+        }
+        class QueueCoreStats {
+            +ReadyInMemory : int
+            +LockedInMemory : int
+            +PendingOnDisk : int
+            +DeadLetters : int
+        }
+    }
+    namespace Sdk {
+        class SefMqClusterClient {
+            +PostAsync(path, body) Task
+            +GetAsync(path) Task
+        }
+        class SefMqProducer {
+            +Send(record, callback) void
+            +SendAsync(record) Task
+        }
+        class SefMqConsumer {
+            +BeginConsume(queue, handler) Task
+        }
+        class SefMqAdmin {
+            +QueueStatsAsync() Task
+            +DlqListAsync() Task
+            +DlqReviveAsync(id) Task
+        }
+        class SefMqRecord {
+            +Topic : string
+            +Key : string
+            +Value : string
+        }
+        class SefMqContext {
+            +Ack(id) Task
+            +Nack(id) Task
+        }
+    }
+    namespace WebApi {
+        class QueueEndpoints {
+            <<static>>
+            +MapQueueApi(app, hub)
+        }
+        class ExchangeEndpoints {
+            <<static>>
+            +MapExchangeApi(app, hub)
+        }
+        class DeadLetterEndpoints {
+            <<static>>
+            +MapDeadLetterApi(app, hub)
+        }
+        class ClusterEndpoints {
+            <<static>>
+            +MapClusterApi(app, hub)
+        }
+        class RaftEndpoints {
+            <<static>>
+            +MapRaftApi(app, raft, hub)
+        }
+        class MonitoringEndpoints {
+            <<static>>
+            +MapMonitoringApi(app, hub)
+            +StartSweeper(app, hub)
+        }
+        class DashboardPage {
+            <<static>>
+            +Html$ : string
+        }
+    }
+
+    MessageQueueHub "1" *-- "N" QueueCore : 队列池
+    QueueCore "1" *-- "2" Log : 主账+死信账
+    Log "1" *-- "N" LogSegment : 分段
+    LogSegment --> LogMessage : 存行
+    QueueCore ..> MessageRegistry : 挂账/查重
+    MessageRegistry --> RegistryEntry : 索引
+    RaftNode "1" *-- "1" MembershipStore : 成员表
+    MembershipStore --> RaftMember : 行
+    RaftNode --> RaftVoteResponse : 投票结果
+    ClusterReplicator --> ReplicationResult : 回执
+    ClusterReplicator --> RaftNode : 读王位/票池
+    MessageQueueHub --> ClusterReplicator : 复制调度
+    MessageQueueHub --> ExchangeDef : 交换机表
+    ExchangeDef "1" *-- "N" Binding : 绑定
+    QueueCore --> MqMessage : 存取
+    QueueCore --> QueueCoreStats : 统计
+    LogMessage --> MqMessage : 载荷
+    SefMqProducer --> SefMqClusterClient : 经王调用
+    SefMqConsumer --> SefMqClusterClient : 经王调用
+    SefMqAdmin --> SefMqClusterClient : 经王调用
+    SefMqProducer --> SefMqRecord : 发送体
+    SefMqConsumer --> SefMqContext : 断案手柄
+    SefMqConsumer --> MqMessage : 消费体
+    QueueEndpoints --> MessageQueueHub : 收发/建队
+    ExchangeEndpoints --> MessageQueueHub : 投递/绑定
+    DeadLetterEndpoints --> MessageQueueHub : 死信处置
+    ClusterEndpoints --> MessageQueueHub : 复制接收
+    RaftEndpoints --> RaftNode : 选主/成员
+    MonitoringEndpoints --> DashboardPage : 吐页面
+```
+
+读法：先看四个 `*--`（谁拥有谁）：Hub 拥有 N 个 QueueCore、每个 QueueCore 拥有 2 本账（主账+死信）、账由 N 个段组成、交换机由 N 条绑定组成。其余都是"用一下"的虚线依赖。`Program.cs` 不在图中——它只是把这些类 new 出来插在一起的薄启动器。
+
 ---
 
 ## 4. 用例图（谁用产品做什么）
