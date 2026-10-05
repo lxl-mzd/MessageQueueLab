@@ -44,3 +44,9 @@ public sealed class SefMqProducer : IDisposable
         return new SefMqMetadata(msg.Id, replRaw, record.Key);
     }
 }
+
+/// <summary>Record：发什么（Topic/Key/Value 三件套，Kafka 同款卷装）</summary>
+public sealed record SefMqRecord(string Topic, string? Key, string Value);
+
+/// <summary>RecordMetadata 同款：发送到哪儿了</summary>
+public sealed record SefMqMetadata(string Topic, string MessageId, string? Key);
