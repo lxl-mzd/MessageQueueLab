@@ -34,7 +34,7 @@ public sealed class SefMqProducer : IDisposable
     private async Task<SefMqMetadata> SendInternalAsync(SefMqRecord record)
     {
         var resp = await _cluster.PostAsync($"/api/q/{record.Topic}/messages",
-            JsonContent.Create(new { content = record.Value, key = record.Key }));
+            JsonContent.Create(new { content = record.Value, key = record.Key, ttlSeconds = record.TtlSeconds }));
         resp.EnsureSuccessStatusCode();
         var doc = JsonSerializer.Deserialize<JsonElement>(await resp.Content.ReadAsStringAsync());
         // 集群版响应形状：{ message: MqMessage, replication: {...} }
@@ -43,10 +43,28 @@ public sealed class SefMqProducer : IDisposable
         var replRaw = doc.TryGetProperty("replication", out var replEl) ? replEl.GetRawText() : "{}";
         return new SefMqMetadata(msg.Id, replRaw, record.Key);
     }
+
+    /// <summary>经交换机发布（routingKey 为空则用 Record.Key，服务端再兜底 normal）。返回投递到的队列数。</summary>
+    public async Task<int> PublishViaExchangeAsync(string exchange, SefMqRecord record, string? routingKey = null)
+    {
+        var key = routingKey ?? record.Key;
+        var url = string.IsNullOrWhiteSpace(key)
+            ? $"/api/ex/{exchange}/publish"
+            : $"/api/ex/{exchange}/publish?routingKey={Uri.EscapeDataString(key)}";
+        var resp = await _cluster.PostAsync(url,
+            JsonContent.Create(new { content = record.Value, key = record.Key, ttlSeconds = record.TtlSeconds }));
+        resp.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        return doc.RootElement.TryGetProperty("deliveredTo", out var d) ? d.GetInt32() : 0;
+    }
 }
 
-/// <summary>Record：发什么（Topic/Key/Value 三件套，Kafka 同款卷装）</summary>
-public sealed record SefMqRecord(string Topic, string? Key, string Value);
+/// <summary>Record：发什么（Topic/Key/Value 三件套 + 可选 TTL 秒数，Kafka 同款卷装）</summary>
+public sealed record SefMqRecord(string Topic, string? Key, string Value, int? TtlSeconds = null)
+{
+    /// <summary>链式加 TTL：new SefMqRecord(t, k, v).WithTtl(60)</summary>
+    public SefMqRecord WithTtl(int seconds) => this with { TtlSeconds = seconds };
+}
 
 /// <summary>RecordMetadata 同款：发送到哪儿了</summary>
 public sealed record SefMqMetadata(string Topic, string MessageId, string? Key);

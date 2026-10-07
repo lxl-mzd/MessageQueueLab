@@ -48,4 +48,27 @@ public sealed class SefMqAdmin : IDisposable
 
     public Task<HttpResponseMessage> DlqAckAsync(string id)    => _cluster.PostAsync($"/api/q/{_queue}/dlq/{id}/ack", null);
     public Task<HttpResponseMessage> DlqReviveAsync(string id) => _cluster.PostAsync($"/api/q/{_queue}/dlq/{id}/revive", null);
+
+    /// <summary>声明队列（幂等：已存在也成功）。queue 为空则操作本 Admin 绑定的队。</summary>
+    public async Task DeclareQueueAsync(string? queue = null)
+    {
+        var resp = await _cluster.PostAsync($"/api/q/{queue ?? _queue}", null);
+        resp.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>交换机绑路由：pattern 支持 *（一段）与 #（多段），如 e2e.#</summary>
+    public async Task BindAsync(string exchange, string pattern, string queue)
+    {
+        var resp = await _cluster.PostAsync(
+            $"/api/ex/{exchange}/bind?pattern={Uri.EscapeDataString(pattern)}&queue={Uri.EscapeDataString(queue)}", null);
+        resp.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>解绑（Bind 的逆操作）</summary>
+    public async Task UnbindAsync(string exchange, string pattern, string queue)
+    {
+        var resp = await _cluster.PostAsync(
+            $"/api/ex/{exchange}/unbind?pattern={Uri.EscapeDataString(pattern)}&queue={Uri.EscapeDataString(queue)}", null);
+        resp.EnsureSuccessStatusCode();
+    }
 }
