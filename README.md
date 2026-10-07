@@ -32,7 +32,7 @@ docker compose up -d --build
 # 看板: http://127.0.0.1:5081/ (King), :5082, :5083
 ```
 
-文档见 `PRODUCT.md`（产品蓝图：架构/模块/用例/时序/状态机）`ARCHITECTURE.md`（架构图）`API.md`（接口）与 `DESIGN.md`（设计全文）。
+文档见 `PRODUCT.md`（产品蓝图：架构/模块/用例/时序/状态机）`ARCHITECTURE.md`（架构图）`API.md`（接口）`TEST.md`（测试方案与实测结果）与 `DESIGN.md`（设计全文）。
 
 ## CI/CD
 
